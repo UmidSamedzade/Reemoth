@@ -1,0 +1,21 @@
+[package]
+name = "reemoth-signaling"
+description = "Reemoth signaling server (Cloudflare Worker + Durable Objects)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+reemoth-proto = { path = "../crates/reemoth-proto" }
+worker = "0.8.7"
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
+
+[workspace]

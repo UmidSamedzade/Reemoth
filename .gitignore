@@ -1,4 +1,6 @@
-/target
+target/
+signaling/build/
+*.log
 **/*.rs.bk
 .wrangler/
 node_modules/

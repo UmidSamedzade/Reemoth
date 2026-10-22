@@ -109,6 +109,8 @@ Bitrate is adaptive: about 6–25 Mbps for 1080p60, with a floor of 2 Mbps. When
 6. **Brute-force protection:** exponential back-off and lockout per host ID, enforced both in the Durable Object and on the host itself. The host's stored verifier uses Argon2id. A minimum password strength is enforced in the UI.
 7. TURN credentials are minted by the Worker, are short-lived (about 10 min), and are issued only after the PAKE succeeds. This keeps the relay from being abused.
 
+Until M1 lands, signaling rooms are unauthenticated: anyone can open a room for any ID (each room is capped at 8 sockets). M1 must add per-IP rate limiting on `/v1/host/*` (a Cloudflare rate-limiting binding) and allow only registered hosts to create rooms.
+
 Also: an optional allow-list of client device keys (trust on first use), a session indicator on the host (no prompt, but visible), and an audit log of connections.
 
 ## 5. Serverless infrastructure

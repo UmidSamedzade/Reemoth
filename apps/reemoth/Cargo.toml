@@ -1,0 +1,19 @@
+[package]
+name = "reemoth"
+description = "Low-latency P2P remote desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reemoth-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true

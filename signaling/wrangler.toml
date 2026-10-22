@@ -1,0 +1,14 @@
+name = "reemoth-signaling"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "worker-build --release"
+
+[[durable_objects.bindings]]
+name = "HOST_ROOMS"
+class_name = "HostRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HostRoom"]

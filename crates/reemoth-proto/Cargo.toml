@@ -1,0 +1,15 @@
+[package]
+name = "reemoth-proto"
+description = "Wire types shared by the Reemoth app and signaling server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

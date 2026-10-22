@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.wrangler/
+node_modules/
+.dev.vars
+.omc/
+.env

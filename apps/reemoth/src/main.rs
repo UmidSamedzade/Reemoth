@@ -66,6 +66,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    // rustls cannot pick a crypto backend by itself when none is the default.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
     let filter = match cli.verbose {
         0 => "warn",

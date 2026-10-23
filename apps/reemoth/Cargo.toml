@@ -16,6 +16,8 @@ clap.workspace = true
 directories = "6"
 futures-util.workspace = true
 rpassword = "7"
+# TLS for wss:// signaling. aws-lc-rs is already linked via str0m.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "signal", "sync"] }

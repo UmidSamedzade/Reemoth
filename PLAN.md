@@ -157,7 +157,7 @@ tools/
 | # | Milestone | Done when |
 |---|---|---|
 | M0 ✅ | Workspace, CI (Windows + Linux builds, clippy, tests), signaling Worker skeleton deployed | `cargo build` green on both OSes; Worker answers a WebSocket ping |
-| M1 ✅ | **Connectivity:** ID registration, PAKE, ICE via STUN/TURN, data channel echo | Two machines on different networks (one on mobile hotspot/CGNAT) connect with no port forwarding; TURN fallback verified by blocking UDP. *Status: done and tested locally (direct path, wrong-password refusal, latency and throughput); cross-network and live TURN tests are pending your two-PC run.* |
+| M1 ✅ | **Connectivity:** ID registration, PAKE, ICE via STUN/TURN, data channel echo | Two machines on different networks (one on mobile hotspot/CGNAT) connect with no port forwarding; TURN fallback verified by blocking UDP. *Status: verified 2026-10-23 between Windows and Linux PCs on different ISPs: direct P2P (hole punched), connected in 2.7 s, 10 ms RTT, 51 Mbit/s, no port forwarding. Live TURN fallback still untested (no TURN key configured).* |
 | M2 | **Video, Windows:** DXGI capture → NVENC H.264 → RTP → D3D11VA decode → wgpu present | 1080p60 stable across the internet, with on-screen stats overlay (fps, bitrate, RTT, loss, per-stage latency) |
 | M3 | **Input + cursor overlay + clipboard** | Full desktop control; pointer feels local |
 | M4 | **Adaptive quality:** GCC bitrate → encoder, intra-refresh, LTR/reference invalidation | At 2% packet loss and 100 ms RTT (netem), there are no freezes longer than 1 frame and no IDR storms |

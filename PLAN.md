@@ -107,9 +107,19 @@ Bitrate is adaptive: about 6–25 Mbps for 1080p60, with a floor of 2 Mbps. When
 4. The PAKE session key **authenticates the SDP**, including both DTLS fingerprints, with an HMAC. A compromised signaling server therefore cannot MITM the media path.
 5. ICE runs (P2P first, TURN fallback), then DTLS. The session starts **without any accept prompt**, as requested.
 6. **Brute-force protection:** exponential back-off and lockout per host ID, enforced both in the Durable Object and on the host itself. The host's stored verifier uses Argon2id. A minimum password strength is enforced in the UI.
-7. TURN credentials are minted by the Worker, are short-lived (about 10 min), and are issued only after the PAKE succeeds. This keeps the relay from being abused.
+7. TURN credentials are minted by the Worker and issued only after the host reports a successful PAKE. They last 4 hours, so a relayed session longer than that loses its relay until mid-session re-minting is added.
 
-Until M1 lands, signaling rooms are unauthenticated: anyone can open a room for any ID (each room is capped at 8 sockets). M1 must add per-IP rate limiting on `/v1/host/*` (a Cloudflare rate-limiting binding) and allow only registered hosts to create rooms.
+As built in M1:
+- **ID ownership:** the first Ed25519 key to register an ID owns it, proven by signing a server challenge. Unanswered host sockets expire after 10 s, at most 2 can be pending, and they don't count toward the room's 8-socket cap.
+- **Rate limits:**
+  - 60 connects/min per IP across all rooms.
+  - 20 client sessions/min per room.
+  - Clients of an offline host are refused before anything is written to storage.
+- **TURN abuse:** anyone can claim an ID and authorize their own sessions, so minting is capped at 30/day per room and 10/min per host IP. Past either cap, clients get STUN only. Set a Cloudflare budget alert on TURN usage.
+- **Password guessing:**
+  - The host evaluates one attempt at a time and backs off after 5 failures (5 s doubling to 15 min).
+  - The back-off lives in host memory: it survives signaling reconnects but not a host restart.
+  - Failure-based back-off in the Durable Object is still to do.
 
 Also: an optional allow-list of client device keys (trust on first use), a session indicator on the host (no prompt, but visible), and an audit log of connections.
 
@@ -146,8 +156,8 @@ tools/
 
 | # | Milestone | Done when |
 |---|---|---|
-| M0 | Workspace, CI (Windows + Linux builds, clippy, tests), signaling Worker skeleton deployed | `cargo build` green on both OSes; Worker answers a WebSocket ping |
-| M1 | **Connectivity:** ID registration, PAKE, ICE via STUN/TURN, data channel echo | Two machines on different networks (one on mobile hotspot/CGNAT) connect with no port forwarding; TURN fallback verified by blocking UDP |
+| M0 ✅ | Workspace, CI (Windows + Linux builds, clippy, tests), signaling Worker skeleton deployed | `cargo build` green on both OSes; Worker answers a WebSocket ping |
+| M1 ✅ | **Connectivity:** ID registration, PAKE, ICE via STUN/TURN, data channel echo | Two machines on different networks (one on mobile hotspot/CGNAT) connect with no port forwarding; TURN fallback verified by blocking UDP. *Status: done and tested locally (direct path, wrong-password refusal, latency and throughput); cross-network and live TURN tests are pending your two-PC run.* |
 | M2 | **Video, Windows:** DXGI capture → NVENC H.264 → RTP → D3D11VA decode → wgpu present | 1080p60 stable across the internet, with on-screen stats overlay (fps, bitrate, RTT, loss, per-stage latency) |
 | M3 | **Input + cursor overlay + clipboard** | Full desktop control; pointer feels local |
 | M4 | **Adaptive quality:** GCC bitrate → encoder, intra-refresh, LTR/reference invalidation | At 2% packet loss and 100 ms RTT (netem), there are no freezes longer than 1 frame and no IDR storms |

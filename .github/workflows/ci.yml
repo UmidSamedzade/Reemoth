@@ -64,7 +64,7 @@ jobs:
         run: npm ci
       - name: Build reemoth CLI
         run: cargo build -p reemoth
-      - name: End-to-end ping against wrangler dev
+      - name: End-to-end against wrangler dev
         working-directory: signaling
         run: |
           npx wrangler dev --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
@@ -76,4 +76,37 @@ jobs:
             sleep 2
           done
           [ -n "$up" ] || { echo "wrangler dev did not come up"; cat wrangler.log; exit 1; }
-          ../target/debug/reemoth signal-ping --server ws://127.0.0.1:8787 --count 3 || { cat wrangler.log; exit 1; }
+          ../target/debug/reemoth signal-ping --signal ws://127.0.0.1:8787 --count 3 || { cat wrangler.log; exit 1; }
+          bash ../scripts/e2e.sh ../target/debug/reemoth ws://127.0.0.1:8787 || { cat wrangler.log; exit 1; }
+
+  release-binaries:
+    name: binary (${{ matrix.name }})
+    needs: native
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            file: reemoth.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            file: reemoth
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release -p reemoth --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reemoth-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.file }}

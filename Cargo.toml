@@ -9,11 +9,15 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/UmidSamedzade/Reemoth"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 reemoth-proto = { path = "crates/reemoth-proto" }
+reemoth-auth = { path = "crates/reemoth-auth" }
+reemoth-net = { path = "crates/reemoth-net" }
 anyhow = "1.0.104"
+base64 = "0.22"
+tracing = "0.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }

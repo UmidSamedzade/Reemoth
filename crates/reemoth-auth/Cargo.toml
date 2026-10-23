@@ -1,0 +1,23 @@
+[package]
+name = "reemoth-auth"
+description = "Host identity, password PAKE and session key derivation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reemoth-proto.workspace = true
+argon2 = "0.5"
+base64.workspace = true
+ed25519-dalek = "2.2"
+getrandom = "0.2"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+spake2 = "0.4"
+zeroize = "1"
+
+[lints]
+workspace = true

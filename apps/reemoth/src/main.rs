@@ -1,55 +1,184 @@
+mod client;
+mod config;
+mod host;
 mod signal_client;
 
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use reemoth_proto::signal::HostId;
+use reemoth_proto::signal::{HostId, Role, SignalMsg};
+
+use crate::config::ConfigFile;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = "Low-latency peer-to-peer remote desktop")]
 struct Cli {
+    /// Signaling server URL, e.g. wss://reemoth-signaling.example.workers.dev
+    /// (saved for next time).
+    #[arg(long, global = true)]
+    signal: Option<String>,
+    /// Config directory (defaults to the per-user app config folder).
+    #[arg(long, global = true, env = "REEMOTH_CONFIG_DIR")]
+    config_dir: Option<PathBuf>,
+    /// More logging (-v info, -vv debug).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Round-trip pings to a host's signaling room and report latency.
-    SignalPing {
-        /// Signaling server base URL, e.g. wss://signal.example.com
-        #[arg(
-            long,
-            env = "REEMOTH_SIGNAL_URL",
-            default_value = "ws://127.0.0.1:8787"
-        )]
-        server: String,
-        /// Nine-digit host ID.
-        #[arg(long, default_value = "000000001")]
+    /// Make this PC reachable: register its ID and accept password-authenticated connections.
+    Host,
+    /// Set or change this host's password (or set REEMOTH_PASSWORD).
+    SetPassword,
+    /// Connect to a host and test the peer-to-peer link.
+    Connect {
+        /// The host's nine-digit ID (spaces allowed).
         id: String,
+        /// Password (prompted if omitted; or set REEMOTH_PASSWORD).
+        #[arg(long)]
+        password: Option<String>,
+        /// Offer only the TURN relay candidate, to test the relay path.
+        #[arg(long)]
+        relay_only: bool,
+        /// Number of latency pings (0 to skip).
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(0..=10_000))]
+        pings: u32,
+        /// MiB to send for the throughput test (0 to skip).
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(0..=4096))]
+        bulk_mib: u32,
+        /// Exit after the tests instead of opening the chat prompt.
+        #[arg(long)]
+        no_chat: bool,
+    },
+    /// Show this PC's host ID and settings.
+    Info,
+    /// Round-trip pings to the signaling server.
+    SignalPing {
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1000))]
         count: u32,
     },
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
-        Command::SignalPing { server, id, count } => {
-            let id = HostId::parse(&id).context("host ID must be nine digits")?;
-            let mut client = signal_client::SignalClient::connect(&server, id).await?;
-            let mut samples = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let rtt = tokio::time::timeout(Duration::from_secs(5), client.ping())
-                    .await
-                    .context("ping timed out")??;
-                println!("pong in {:.2} ms", rtt.as_secs_f64() * 1e3);
-                samples.push(rtt);
-            }
-            if let (Some(min), Some(max)) = (samples.iter().min(), samples.iter().max()) {
-                println!("{count} pings: min {min:.2?}, max {max:.2?}");
-            }
-            client.close().await
-        }
+async fn main() {
+    let cli = Cli::parse();
+    let filter = match cli.verbose {
+        0 => "warn",
+        1 => "info,str0m=warn",
+        _ => "debug",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    if let Err(e) = run(cli).await {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
     }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
+    let dir = match cli.config_dir {
+        Some(dir) => dir,
+        None => ConfigFile::default_dir()?,
+    };
+    let mut cfg = ConfigFile::load(&dir)?;
+    let signal_url = cfg.resolve_signal_url(cli.signal)?;
+
+    match cli.command {
+        Command::Host => {
+            if cfg.host_password()?.is_none() {
+                println!("No password set yet. Clients will need it to connect.");
+                let pw = host::prompt_new_password()?;
+                cfg.set_host_password(&pw)?;
+            }
+            host::run(&mut cfg, host::HostOptions { signal_url }).await
+        }
+        Command::SetPassword => {
+            let pw = host::prompt_new_password()?;
+            cfg.set_host_password(&pw)?;
+            println!("Password saved. Restart `reemoth host` if it is running.");
+            Ok(())
+        }
+        Command::Connect {
+            id,
+            password,
+            relay_only,
+            pings,
+            bulk_mib,
+            no_chat,
+        } => {
+            let id = HostId::parse(&id).context("host ID must be nine digits")?;
+            let password = match password.or_else(|| std::env::var("REEMOTH_PASSWORD").ok()) {
+                Some(pw) => pw,
+                None => rpassword::prompt_password(format!("Password for {}: ", id.grouped()))?,
+            };
+            client::run(client::ConnectOptions {
+                signal_url,
+                id,
+                password,
+                relay_only,
+                pings,
+                bulk_mib,
+                chat: !no_chat,
+            })
+            .await
+        }
+        Command::Info => {
+            println!("config:    {}", cfg.path().display());
+            println!("signaling: {signal_url}");
+            match &cfg.config.host {
+                Some(h) => {
+                    let id = HostId::new(h.id).context("invalid host ID in config")?;
+                    println!("host ID:   {}", id.grouped());
+                    println!(
+                        "password:  {}",
+                        if h.password.is_some() {
+                            "set"
+                        } else {
+                            "not set"
+                        }
+                    );
+                }
+                None => println!("host ID:   none yet (run `reemoth host`)"),
+            }
+            Ok(())
+        }
+        Command::SignalPing { count } => signal_ping(&signal_url, count).await,
+    }
+}
+
+/// Pings the server through an unauthenticated host-role socket in a scratch room.
+async fn signal_ping(url: &str, count: u32) -> anyhow::Result<()> {
+    let id = HostId::new(1).expect("valid");
+    let mut conn = signal_client::SignalConn::connect(url, id, Role::Host).await?;
+    let SignalMsg::Challenge { .. } = conn.expect().await? else {
+        bail!("unexpected greeting from the signaling server");
+    };
+    let mut samples = Vec::with_capacity(count as usize);
+    for nonce in 1..=u64::from(count) {
+        let start = Instant::now();
+        conn.send(SignalMsg::Ping { nonce })?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), conn.expect())
+            .await
+            .context("ping timed out")??;
+        if reply != (SignalMsg::Pong { nonce }) {
+            bail!("expected pong {nonce}, got {reply:?}");
+        }
+        let rtt = start.elapsed();
+        println!("pong in {:.2} ms", rtt.as_secs_f64() * 1e3);
+        samples.push(rtt);
+    }
+    if let (Some(min), Some(max)) = (samples.iter().min(), samples.iter().max()) {
+        println!("{count} pings: min {min:.2?}, max {max:.2?}");
+    }
+    Ok(())
 }

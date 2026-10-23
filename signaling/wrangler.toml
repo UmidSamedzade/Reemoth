@@ -9,6 +9,23 @@ command = "worker-build --release"
 name = "HOST_ROOMS"
 class_name = "HostRoom"
 
+# Per-IP connection attempts across all rooms.
+[[ratelimits]]
+name = "CONNECT_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+# TURN credential mints per host IP.
+[[ratelimits]]
+name = "TURN_MINT_LIMITER"
+namespace_id = "1002"
+simple = { limit = 10, period = 60 }
+
+# Optional TURN relay (Cloudflare Realtime TURN). Without these, peers get
+# STUN only and connections between two strict NATs will fail.
+#   npx wrangler secret put TURN_KEY_ID
+#   npx wrangler secret put TURN_KEY_API_TOKEN
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["HostRoom"]

@@ -9,11 +9,19 @@ rust-version.workspace = true
 
 [dependencies]
 reemoth-proto.workspace = true
+reemoth-auth.workspace = true
+reemoth-net.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+directories = "6"
 futures-util.workspace = true
-tokio.workspace = true
+rpassword = "7"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "signal", "sync"] }
 tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true

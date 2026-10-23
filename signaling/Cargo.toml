@@ -11,6 +11,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 reemoth-proto = { path = "../crates/reemoth-proto" }
+base64 = "0.22"
+ed25519-dalek = { version = "2.2", default-features = false }
+getrandom = { version = "0.2", features = ["js"] }
+serde = { version = "1.0.229", features = ["derive"] }
 worker = "0.8.7"
 
 [profile.release]

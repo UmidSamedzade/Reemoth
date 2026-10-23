@@ -1,7 +1,10 @@
 mod client;
 mod config;
 mod host;
+mod render;
 mod signal_client;
+mod stream;
+mod viewer;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -55,6 +58,17 @@ enum Command {
         #[arg(long)]
         no_chat: bool,
     },
+    /// Show a host's screen in a window.
+    View {
+        /// The host's nine-digit ID (spaces allowed).
+        id: String,
+        /// Password (prompted if omitted; or set REEMOTH_PASSWORD).
+        #[arg(long)]
+        password: Option<String>,
+        /// Offer only the TURN relay candidate, to test the relay path.
+        #[arg(long)]
+        relay_only: bool,
+    },
     /// Show this PC's host ID and settings.
     Info,
     /// Round-trip pings to the signaling server.
@@ -64,13 +78,12 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // rustls cannot pick a crypto backend by itself when none is the default.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
     let filter = match cli.verbose {
-        0 => "warn",
+        0 => "warn,wgpu_hal=error,wgpu_core=error",
         1 => "info,str0m=warn",
         _ => "debug",
     };
@@ -81,28 +94,65 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+fn run(cli: Cli) -> anyhow::Result<()> {
     let dir = match cli.config_dir {
         Some(dir) => dir,
         None => ConfigFile::default_dir()?,
     };
     let mut cfg = ConfigFile::load(&dir)?;
     let signal_url = cfg.resolve_signal_url(cli.signal)?;
+    let rt = tokio::runtime::Runtime::new().context("starting async runtime")?;
 
     match cli.command {
+        // The window needs the main thread, so the viewer drives the runtime itself.
+        Command::View {
+            id,
+            password,
+            relay_only,
+        } => {
+            let id = HostId::parse(&id).context("host ID must be nine digits")?;
+            let target = client::Target {
+                signal_url,
+                id,
+                password: password_for(id, password)?,
+                relay_only,
+            };
+            viewer::run(rt, target)
+        }
+        command => rt.block_on(run_async(&mut cfg, signal_url, command)),
+    }
+}
+
+fn password_for(id: HostId, flag: Option<String>) -> anyhow::Result<String> {
+    match flag.or_else(|| std::env::var("REEMOTH_PASSWORD").ok()) {
+        Some(pw) => Ok(pw),
+        None => Ok(rpassword::prompt_password(format!(
+            "Password for {}: ",
+            id.grouped()
+        ))?),
+    }
+}
+
+async fn run_async(
+    cfg: &mut ConfigFile,
+    signal_url: String,
+    command: Command,
+) -> anyhow::Result<()> {
+    match command {
+        Command::View { .. } => unreachable!("handled before the runtime starts"),
         Command::Host => {
             if cfg.host_password()?.is_none() {
                 println!("No password set yet. Clients will need it to connect.");
                 let pw = host::prompt_new_password()?;
                 cfg.set_host_password(&pw)?;
             }
-            host::run(&mut cfg, host::HostOptions { signal_url }).await
+            host::run(cfg, host::HostOptions { signal_url }).await
         }
         Command::SetPassword => {
             let pw = host::prompt_new_password()?;
@@ -119,15 +169,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             no_chat,
         } => {
             let id = HostId::parse(&id).context("host ID must be nine digits")?;
-            let password = match password.or_else(|| std::env::var("REEMOTH_PASSWORD").ok()) {
-                Some(pw) => pw,
-                None => rpassword::prompt_password(format!("Password for {}: ", id.grouped()))?,
-            };
             client::run(client::ConnectOptions {
-                signal_url,
-                id,
-                password,
-                relay_only,
+                target: client::Target {
+                    signal_url,
+                    id,
+                    password: password_for(id, password)?,
+                    relay_only,
+                },
                 pings,
                 bulk_mib,
                 chat: !no_chat,

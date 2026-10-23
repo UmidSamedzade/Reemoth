@@ -37,7 +37,7 @@ impl PeerMsg {
 }
 
 /// Text messages on the `ctrl` data channel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CtrlMsg {
     Ping {
@@ -57,6 +57,17 @@ pub enum CtrlMsg {
     BulkReport {
         bytes: u64,
         micros: u64,
+    },
+    /// Host → viewer, once a second while streaming.
+    HostStats {
+        width: u32,
+        height: u32,
+        fps: f32,
+        /// Mean capture-to-encoded time, milliseconds.
+        encode_ms: f32,
+        /// Current encoder target, kbit/s.
+        bitrate_kbps: u32,
+        encoder: String,
     },
 }
 

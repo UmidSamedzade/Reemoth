@@ -7,7 +7,7 @@ use anyhow::{Context, bail};
 use reemoth_auth::{ClientPake, PasswordSecret, SessionKeys, b64, unb64};
 use reemoth_net::ChannelId;
 use reemoth_net::gather::GatherOptions;
-use reemoth_net::{NetEvent, PeerConnection, Prepared, gather};
+use reemoth_net::{NetEvent, PathInfo, PeerConnection, Prepared, gather};
 use reemoth_proto::peer::{CtrlMsg, PeerMsg};
 use reemoth_proto::signal::{HostId, IceServer, Role, SessionId, SignalMsg};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -16,36 +16,62 @@ use crate::signal_client::SignalConn;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct ConnectOptions {
+/// Which host to reach and how.
+pub struct Target {
     pub signal_url: String,
     pub id: HostId,
     pub password: String,
     pub relay_only: bool,
+}
+
+pub struct ConnectOptions {
+    pub target: Target,
     pub pings: u32,
     pub bulk_mib: u32,
     pub chat: bool,
 }
 
 pub async fn run(opts: ConnectOptions) -> anyhow::Result<()> {
-    let started = Instant::now();
-    let mut conn = SignalConn::connect(&opts.signal_url, opts.id, Role::Client).await?;
-    println!("Contacting host {} ...", opts.id.grouped());
+    let (mut peer, ctrl, _) = establish(&opts.target, false, &|line| println!("{line}")).await?;
+    if opts.pings > 0 {
+        ping_test(&mut peer, ctrl, opts.pings).await?;
+    }
+    if opts.bulk_mib > 0 {
+        bulk_test(&mut peer, ctrl, opts.bulk_mib).await?;
+    }
+    if opts.chat {
+        chat(&mut peer, ctrl).await?;
+    }
+    peer.close().await;
+    Ok(())
+}
 
-    let (session, keys, servers) = authenticate(&mut conn, &opts).await?;
-    println!("Password accepted by host.");
+/// Authenticates, exchanges SDP and waits until the P2P link and the `ctrl`
+/// channel are up. `log` receives progress lines.
+pub async fn establish(
+    target: &Target,
+    receive_video: bool,
+    log: &(dyn Fn(&str) + Sync),
+) -> anyhow::Result<(PeerConnection, ChannelId, PathInfo)> {
+    let started = Instant::now();
+    let mut conn = SignalConn::connect(&target.signal_url, target.id, Role::Client).await?;
+    log(&format!("Contacting host {} ...", target.id.grouped()));
+
+    let (session, keys, servers) = authenticate(&mut conn, target).await?;
+    log("Password accepted by host.");
 
     let gathered = gather(
         &servers,
         &GatherOptions {
-            relay_only: opts.relay_only,
+            relay_only: target.relay_only,
         },
     )
     .await?;
     for c in gathered.describe() {
-        println!("  local candidate: {c}");
+        log(&format!("  local candidate: {c}"));
     }
     let mut prepared = Prepared::new(gathered);
-    let (offer, pending) = prepared.create_offer(&["ctrl"])?;
+    let (offer, pending) = prepared.create_offer(&["ctrl"], receive_video)?;
     conn.send(SignalMsg::Relay {
         session,
         payload: PeerMsg::Offer {
@@ -64,23 +90,13 @@ pub async fn run(opts: ConnectOptions) -> anyhow::Result<()> {
     drop(conn);
 
     let mut peer = prepared.spawn();
-    let ctrl = wait_connected(&mut peer, started).await?;
-    if opts.pings > 0 {
-        ping_test(&mut peer, ctrl, opts.pings).await?;
-    }
-    if opts.bulk_mib > 0 {
-        bulk_test(&mut peer, ctrl, opts.bulk_mib).await?;
-    }
-    if opts.chat {
-        chat(&mut peer, ctrl).await?;
-    }
-    peer.close().await;
-    Ok(())
+    let (ctrl, path) = wait_connected(&mut peer, started, log).await?;
+    Ok((peer, ctrl, path))
 }
 
 async fn authenticate(
     conn: &mut SignalConn,
-    opts: &ConnectOptions,
+    opts: &Target,
 ) -> anyhow::Result<(SessionId, SessionKeys, Vec<IceServer>)> {
     let (session, hello) = match next(conn).await? {
         SignalMsg::Relay { session, payload } => (session, PeerMsg::decode(&payload)?),
@@ -138,18 +154,25 @@ fn denied(msg: PeerMsg) -> anyhow::Error {
     }
 }
 
-async fn wait_connected(peer: &mut PeerConnection, started: Instant) -> anyhow::Result<ChannelId> {
+async fn wait_connected(
+    peer: &mut PeerConnection,
+    started: Instant,
+    log: &(dyn Fn(&str) + Sync),
+) -> anyhow::Result<(ChannelId, PathInfo)> {
     let mut ctrl = None;
-    let mut connected = false;
-    while !(connected && ctrl.is_some()) {
+    let mut connected = None;
+    while !(connected.is_some() && ctrl.is_some()) {
         match peer.recv().await {
             Some(NetEvent::Connected(path)) => {
-                println!();
-                println!("Connected in {} ms", started.elapsed().as_millis());
-                println!("  path:   {}", path.kind);
-                println!("  local:  {}", path.local);
-                println!("  remote: {}", path.remote);
-                connected = true;
+                log("");
+                log(&format!(
+                    "Connected in {} ms",
+                    started.elapsed().as_millis()
+                ));
+                log(&format!("  path:   {}", path.kind));
+                log(&format!("  local:  {}", path.local));
+                log(&format!("  remote: {}", path.remote));
+                connected = Some(path);
             }
             Some(NetEvent::ChannelOpen { id, label }) if label == "ctrl" => ctrl = Some(id),
             Some(NetEvent::Closed(reason)) => bail!("{reason}"),
@@ -157,7 +180,10 @@ async fn wait_connected(peer: &mut PeerConnection, started: Instant) -> anyhow::
             None => bail!("session ended"),
         }
     }
-    Ok(ctrl.expect("loop exits with a channel"))
+    Ok((
+        ctrl.expect("loop exits with a channel"),
+        connected.expect("loop exits connected"),
+    ))
 }
 
 async fn ping_test(peer: &mut PeerConnection, ctrl: ChannelId, count: u32) -> anyhow::Result<()> {

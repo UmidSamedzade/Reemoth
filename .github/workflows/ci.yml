@@ -92,7 +92,10 @@ jobs:
             file: reemoth.exe
           - name: linux-x86_64
             os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+            # The viewer loads X11/Wayland/GPU drivers at runtime, so it must be
+            # a glibc build; zig pins the glibc version for old distros.
+            target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.31
             file: reemoth
     runs-on: ${{ matrix.os }}
     steps:
@@ -103,9 +106,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release -p reemoth --target ${{ matrix.target }}
+      - if: matrix.zig_target
+        run: |
+          pip install ziglang==0.15.1
+          cargo install cargo-zigbuild --locked
+          cargo zigbuild --release -p reemoth --target ${{ matrix.zig_target }}
+      - if: ${{ !matrix.zig_target }}
+        run: cargo build --release -p reemoth --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: reemoth-${{ matrix.name }}

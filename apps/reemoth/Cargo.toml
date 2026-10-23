@@ -11,10 +11,12 @@ rust-version.workspace = true
 reemoth-proto.workspace = true
 reemoth-auth.workspace = true
 reemoth-net.workspace = true
+reemoth-video.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 directories = "6"
 futures-util.workspace = true
+pollster = "0.4"
 rpassword = "7"
 # TLS for wss:// signaling. aws-lc-rs is already linked via str0m.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
@@ -24,6 +26,8 @@ tokio = { workspace = true, features = ["io-std", "io-util", "signal", "sync"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "25"
+winit = "0.30"
 
 [lints]
 workspace = true

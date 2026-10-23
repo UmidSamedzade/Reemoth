@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::config::ConfigFile;
 use crate::signal_client::{SignalConn, SignalTx};
+use crate::stream::{self, StreamControl};
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -232,12 +233,55 @@ async fn handle_session(
 }
 
 /// Serves one connected client: answers pings, prints chat, measures bulk.
+/// Serves one connected client: streams the screen if it asked for video,
+/// answers pings, prints chat, measures bulk transfers.
 async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
     let mut peer = prepared.spawn();
     let mut ctrl = None;
     let mut bulk: Option<(u64, u64, Instant)> = None; // (expected, received, start)
-    while let Some(event) = peer.recv().await {
+    let mut streaming: Option<(Arc<StreamControl>, std::thread::JoinHandle<()>)> = None;
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(1));
+    let result = loop {
+        let event = tokio::select! {
+            ev = peer.recv() => match ev {
+                Some(ev) => ev,
+                None => break Ok(()),
+            },
+            _ = stats_tick.tick() => {
+                if let (Some((control, _)), Some(id)) = (&streaming, ctrl) {
+                    let s = control.take_stats();
+                    let msg = CtrlMsg::HostStats {
+                        width: s.width,
+                        height: s.height,
+                        fps: s.frames as f32,
+                        encode_ms: if s.frames == 0 { 0.0 } else {
+                            s.encode_time.as_secs_f32() * 1e3 / s.frames as f32
+                        },
+                        bitrate_kbps: s.bitrate_bps / 1000,
+                        encoder: s.encoder,
+                    };
+                    let _ = peer.send(id, false, msg.encode().into_bytes()).await;
+                }
+                continue;
+            }
+        };
         match event {
+            NetEvent::VideoReady if streaming.is_none() => {
+                println!("[{tag}] streaming the screen");
+                let control = Arc::new(StreamControl::default());
+                let handle = stream::spawn(peer.sender(), control.clone());
+                streaming = Some((control, handle));
+            }
+            NetEvent::KeyframeRequested => {
+                if let Some((control, _)) = &streaming {
+                    control.request_keyframe();
+                }
+            }
+            NetEvent::BitrateEstimate(bps) => {
+                if let Some((control, _)) = &streaming {
+                    control.set_available_bandwidth(bps);
+                }
+            }
             NetEvent::Connected(path) => println!(
                 "[{tag}] connected: {}  ({} <-> {})",
                 path.kind, path.local, path.remote
@@ -282,11 +326,16 @@ async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
                     }
                 }
             }
-            NetEvent::Closed(reason) => bail!("{reason}"),
+            NetEvent::Closed(reason) => break Err(anyhow::anyhow!("{reason}")),
             _ => {}
         }
+    };
+    if let Some((control, handle)) = streaming {
+        control.stop();
+        // The thread notices within one capture timeout (100 ms).
+        let _ = tokio::task::spawn_blocking(move || handle.join()).await;
     }
-    Ok(())
+    result
 }
 
 async fn next(rx: &mut mpsc::UnboundedReceiver<SignalMsg>) -> anyhow::Result<SignalMsg> {

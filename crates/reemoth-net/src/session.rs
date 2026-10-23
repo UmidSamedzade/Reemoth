@@ -2,7 +2,10 @@
 //!
 //! [`Prepared`] wraps the `Rtc` and gathered sockets for the SDP exchange;
 //! [`Prepared::spawn`] starts the I/O loop and returns a [`PeerConnection`]
-//! for the app to send and receive data-channel messages through.
+//! for the app to send and receive data-channel messages and video through.
+//!
+//! Video is H.264 (Annex B in, Annex B out) on one m-line: the client offers
+//! it receive-only, the host answers send-only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
@@ -11,8 +14,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::channel::ChannelId;
+use str0m::format::Codec;
+use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Event, IceConnectionState, Input, Output, Rtc};
 use tokio::net::UdpSocket;
@@ -30,6 +36,16 @@ const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 /// str0m's SCTP buffer level above which we hold sends back.
 const CHANNEL_HIGH_WATER: usize = 1024 * 1024;
+/// Bandwidth estimation starts here and probes up towards `VIDEO_MAX_BITRATE`.
+const VIDEO_START_BITRATE: Bitrate = Bitrate::mbps(4);
+const VIDEO_MAX_BITRATE: Bitrate = Bitrate::mbps(25);
+/// Packets str0m waits on for a gap before giving up on in-order delivery.
+/// Must exceed the packet count of the largest keyframe (~250 at 1080p).
+const VIDEO_REORDER_PACKETS: usize = 500;
+/// Packets kept for answering retransmission requests.
+const VIDEO_SEND_BUFFER: usize = 2000;
+/// Don't ask the sender for keyframes more often than this.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -75,6 +91,24 @@ pub enum NetEvent {
         data: Vec<u8>,
     },
     ChannelClosed(ChannelId),
+    /// Host: the peer accepted our video track; frames can be sent now.
+    VideoReady,
+    /// Client: one complete encoded frame.
+    VideoFrame {
+        data: Arc<[u8]>,
+        /// 90 kHz RTP time, extended to 64 bits.
+        rtp_time: u64,
+        /// False if packets were lost since the previous frame; the decoder
+        /// needs a keyframe before it can continue cleanly.
+        contiguous: bool,
+        keyframe: bool,
+        /// When the first packet of this frame arrived.
+        arrived: Instant,
+    },
+    /// Host: the peer wants a keyframe (packet loss, or it just joined).
+    KeyframeRequested,
+    /// Host: estimated available send bandwidth, bits per second.
+    BitrateEstimate(u64),
     /// The session ended; no more events follow.
     Closed(String),
 }
@@ -86,6 +120,15 @@ pub enum NetCmd {
         binary: bool,
         data: Vec<u8>,
     },
+    /// Host: send one encoded Annex B frame.
+    Video {
+        data: Vec<u8>,
+        /// 90 kHz RTP time of the capture.
+        rtp_time: u64,
+        captured: Instant,
+    },
+    /// Client: ask the host for a keyframe.
+    RequestKeyframe,
     Close,
 }
 
@@ -99,7 +142,13 @@ pub struct Prepared {
 
 impl Prepared {
     pub fn new(gathered: Gathered) -> Self {
-        let mut rtc = Rtc::builder().build(Instant::now());
+        let mut rtc = Rtc::builder()
+            .clear_codecs()
+            .enable_h264(true)
+            .enable_bwe(Some(VIDEO_START_BITRATE))
+            .set_reordering_size_video(VIDEO_REORDER_PACKETS)
+            .set_send_buffer_video(VIDEO_SEND_BUFFER)
+            .build(Instant::now());
         for c in &gathered.candidates {
             rtc.add_local_candidate(c.clone());
         }
@@ -111,11 +160,19 @@ impl Prepared {
         }
     }
 
-    /// Offerer: creates data channels named `labels` and returns the offer SDP.
-    pub fn create_offer(&mut self, labels: &[&str]) -> anyhow::Result<(String, SdpPendingOffer)> {
+    /// Offerer: creates data channels named `labels` (and a receive-only
+    /// video track if `receive_video`) and returns the offer SDP.
+    pub fn create_offer(
+        &mut self,
+        labels: &[&str],
+        receive_video: bool,
+    ) -> anyhow::Result<(String, SdpPendingOffer)> {
         let mut api = self.rtc.sdp_api();
         for label in labels {
             api.add_channel((*label).to_owned());
+        }
+        if receive_video {
+            api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         }
         let (offer, pending) = api.apply().context("nothing to offer")?;
         Ok((offer.to_sdp_string(), pending))
@@ -171,6 +228,10 @@ impl Prepared {
             connected: false,
             disconnected_since: None,
             started: Instant::now(),
+            video_send: None,
+            video_recv: None,
+            video_ready_sent: false,
+            last_keyframe_request: None,
         };
         let now = Instant::now();
         if let Some(turn) = &mut driver.turn {
@@ -238,6 +299,11 @@ struct Driver {
     connected: bool,
     disconnected_since: Option<Instant>,
     started: Instant,
+    /// Our sending video track and its H.264 payload type.
+    video_send: Option<(Mid, Pt)>,
+    video_recv: Option<Mid>,
+    video_ready_sent: bool,
+    last_keyframe_request: Option<Instant>,
 }
 
 impl Driver {
@@ -299,6 +365,8 @@ impl Driver {
                         self.queued.entry(id).or_default().push_back((binary, data));
                         self.flush_channel(id)?;
                     }
+                    Some(NetCmd::Video { data, rtp_time, captured }) => self.write_video(data, rtp_time, captured)?,
+                    Some(NetCmd::RequestKeyframe) => self.request_keyframe(),
                     Some(NetCmd::Close) | None => return Ok("closed locally".into()),
                 },
                 _ = tokio::time::sleep_until(deadline.into()) => {
@@ -447,12 +515,115 @@ impl Driver {
         Ok(())
     }
 
+    fn write_video(
+        &mut self,
+        data: Vec<u8>,
+        rtp_time: u64,
+        captured: Instant,
+    ) -> anyhow::Result<()> {
+        let Some((mid, pt)) = self.video_send else {
+            return Ok(());
+        };
+        let Some(writer) = self.rtc.writer(mid) else {
+            return Ok(());
+        };
+        writer
+            .write(
+                pt,
+                captured,
+                MediaTime::new(rtp_time, Frequency::NINETY_KHZ),
+                data,
+            )
+            .context("writing video frame")?;
+        Ok(())
+    }
+
+    fn request_keyframe(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_keyframe_request
+            .is_some_and(|t| now - t < KEYFRAME_REQUEST_INTERVAL)
+        {
+            return;
+        }
+        let Some(mid) = self.video_recv else { return };
+        if let Some(mut writer) = self.rtc.writer(mid) {
+            // Fails until the first packet arrives; the sender starts with a keyframe anyway.
+            if writer
+                .request_keyframe(None, KeyframeRequestKind::Pli)
+                .is_ok()
+            {
+                self.last_keyframe_request = Some(now);
+            }
+        }
+    }
+
+    /// Picks the H.264 payload type matching what openh264 and hardware
+    /// encoders emit: constrained baseline, non-interleaved packetization.
+    fn h264_pt(&mut self, mid: Mid) -> Option<Pt> {
+        let writer = self.rtc.writer(mid)?;
+        let h264: Vec<_> = writer
+            .payload_params()
+            .filter(|p| p.spec().codec == Codec::H264)
+            .collect();
+        h264.iter()
+            .find(|p| {
+                p.spec().format.packetization_mode == Some(1)
+                    && p.spec().format.profile_level_id == Some(0x42e01f)
+            })
+            .or_else(|| {
+                h264.iter()
+                    .find(|p| p.spec().format.packetization_mode == Some(1))
+            })
+            .or(h264.first())
+            .map(|p| p.pt())
+    }
+
+    fn maybe_video_ready(&mut self) {
+        if self.connected && self.video_send.is_some() && !self.video_ready_sent {
+            self.video_ready_sent = true;
+            self.rtc.bwe().set_desired_bitrate(VIDEO_MAX_BITRATE);
+            let _ = self.events.send(NetEvent::VideoReady);
+        }
+    }
+
     /// Returns `Some(reason)` when the session is over.
     fn on_event(&mut self, event: Event) -> Option<String> {
         match event {
             Event::Connected => {
                 self.connected = true;
                 self.disconnected_since = None;
+                self.maybe_video_ready();
+            }
+            Event::MediaAdded(m) if m.kind == MediaKind::Video => match m.direction {
+                Direction::SendOnly | Direction::SendRecv => {
+                    match self.h264_pt(m.mid) {
+                        Some(pt) => self.video_send = Some((m.mid, pt)),
+                        None => tracing::warn!("peer offered video without H.264"),
+                    }
+                    self.maybe_video_ready();
+                }
+                Direction::RecvOnly => self.video_recv = Some(m.mid),
+                Direction::Inactive => {}
+            },
+            Event::MediaData(d) => {
+                let keyframe = d.is_keyframe();
+                let _ = self.events.send(NetEvent::VideoFrame {
+                    data: d.data,
+                    rtp_time: d.time.numer(),
+                    contiguous: d.contiguous,
+                    keyframe,
+                    arrived: d.network_time,
+                });
+            }
+            Event::KeyframeRequest(_) => {
+                let _ = self.events.send(NetEvent::KeyframeRequested);
+            }
+            Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. })
+            | Event::EgressBitrateEstimate(BweKind::Remb { estimate, .. }) => {
+                let _ = self
+                    .events
+                    .send(NetEvent::BitrateEstimate(estimate.as_u64()));
             }
             Event::IceConnectionStateChange(state) => match state {
                 IceConnectionState::Disconnected => {

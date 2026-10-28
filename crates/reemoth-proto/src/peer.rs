@@ -69,6 +69,29 @@ pub enum CtrlMsg {
         bitrate_kbps: u32,
         encoder: String,
     },
+    /// Viewer → host, once a second, so the host can log both ends.
+    ViewerStats {
+        /// Frames drawn in the last second.
+        fps: u32,
+        decoded: u32,
+        kbps: u32,
+        decode_ms: f32,
+        /// First packet arrived → picture ready to draw.
+        ready_ms: f32,
+        keyframe_requests: u32,
+        /// Frames that arrived after lost packets.
+        gaps: u32,
+        /// Longest pause between arriving frames.
+        max_stall_ms: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtt_ms: Option<u32>,
+    },
+    /// Viewer → host: the next binary message is a downscaled I420 copy of
+    /// the picture on screen.
+    Snapshot {
+        width: u32,
+        height: u32,
+    },
 }
 
 impl CtrlMsg {

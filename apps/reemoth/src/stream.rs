@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 /// Frame rate cap, regardless of the display's refresh rate.
 pub const MAX_FPS: f64 = 60.0;
 /// Encoder target never leaves this range, whatever bandwidth estimation says.
-const MIN_BITRATE: u32 = 1_000_000;
+const MIN_BITRATE: u32 = 1_500_000;
 const MAX_BITRATE: u32 = 20_000_000;
 
 /// Shared between the network task and the capture thread.
@@ -30,6 +30,8 @@ pub struct Stats {
     pub frames: u32,
     pub encode_time: Duration,
     pub bitrate_bps: u32,
+    pub bytes: u64,
+    pub keyframes: u32,
     pub encoder: String,
 }
 
@@ -38,11 +40,17 @@ impl StreamControl {
         self.keyframe.store(true, Ordering::Relaxed);
     }
 
-    /// Applies a bandwidth estimate, keeping headroom for retransmissions and
-    /// the data channel.
-    pub fn set_available_bandwidth(&self, bps: u64) {
-        let target = ((bps as f64 * 0.85) as u64).clamp(MIN_BITRATE.into(), MAX_BITRATE.into());
-        self.bitrate.store(target as u32, Ordering::Relaxed);
+    /// Loss-driven bitrate control from the viewer's once-a-second report:
+    /// back off hard on loss, creep up while the link stays clean.
+    pub fn on_viewer_report(&self, lost: bool) {
+        let current = self.bitrate.load(Ordering::Relaxed).max(MIN_BITRATE);
+        let next = if lost {
+            (f64::from(current) * 0.7) as u32
+        } else {
+            (f64::from(current) * 1.1) as u32
+        };
+        self.bitrate
+            .store(next.clamp(MIN_BITRATE, MAX_BITRATE), Ordering::Relaxed);
     }
 
     pub fn stop(&self) {
@@ -55,6 +63,8 @@ impl StreamControl {
         let out = s.clone();
         s.frames = 0;
         s.encode_time = Duration::ZERO;
+        s.bytes = 0;
+        s.keyframes = 0;
         out
     }
 }
@@ -81,7 +91,7 @@ mod platform {
     pub fn run(tx: &mpsc::Sender<NetCmd>, control: &StreamControl) -> anyhow::Result<()> {
         let mut capture = DesktopCapture::primary()?;
         let mut encoder = Encoder::new(EncoderSettings {
-            bitrate_bps: 4_000_000,
+            bitrate_bps: 8_000_000,
             max_fps: MAX_FPS as f32,
             threads: 4,
         })?;
@@ -92,6 +102,8 @@ mod platform {
         }
         let mut frame = I420Frame::new(2, 2);
         let mut have_frame = false;
+        // The latest captured image has not been sent (the encoder skipped it).
+        let mut unsent = false;
         let start = Instant::now();
         let interval = Duration::from_secs_f64(1.0 / MAX_FPS);
         let mut next_due = Instant::now();
@@ -105,19 +117,20 @@ mod platform {
                 std::thread::sleep(next_due - now);
             }
             let wants_keyframe = control.keyframe.swap(false, Ordering::Relaxed);
-            // When a keyframe is wanted but the screen is static, re-encode the last image.
-            let timeout = if wants_keyframe && have_frame {
+            // Re-encode the last image when a keyframe is wanted or the rate
+            // controller skipped it, even if the screen has gone still.
+            let resend = have_frame && (wants_keyframe || unsent);
+            let timeout = if resend {
                 Duration::ZERO
             } else {
                 Duration::from_millis(100)
             };
-            let captured_at = Instant::now();
             match capture.next_frame(timeout)? {
                 CaptureResult::Frame(f) => {
                     frame.fill_from_bgra(f.bgra, f.width, f.height, f.stride)?;
                     have_frame = true;
                 }
-                CaptureResult::Unchanged if wants_keyframe && have_frame => {}
+                CaptureResult::Unchanged if resend => {}
                 CaptureResult::Unchanged => {
                     if wants_keyframe {
                         control.keyframe.store(true, Ordering::Relaxed);
@@ -125,13 +138,17 @@ mod platform {
                     continue;
                 }
             }
+            // Timed from here so the wait for a screen change is not counted.
+            let captured_at = Instant::now();
             next_due = captured_at + interval;
+            unsent = true;
 
             encoder.set_bitrate(control.bitrate.load(Ordering::Relaxed));
             if wants_keyframe {
                 encoder.force_keyframe();
             }
             let Some(encoded) = encoder.encode(&frame)? else {
+                // Over budget: `unsent` stays set, so the next slot retries.
                 if wants_keyframe {
                     control.keyframe.store(true, Ordering::Relaxed);
                 }
@@ -144,6 +161,15 @@ mod platform {
                 s.frames += 1;
                 s.encode_time += captured_at.elapsed();
                 s.bitrate_bps = encoder.bitrate();
+                s.bytes += encoded.data.len() as u64;
+                s.keyframes += u32::from(encoded.keyframe);
+            }
+            unsent = false;
+            if wants_keyframe {
+                tracing::debug!(
+                    "forced keyframe -> encoder produced keyframe={}",
+                    encoded.keyframe
+                );
             }
             let rtp_time = (start.elapsed().as_secs_f64() * 90_000.0) as u64;
             let cmd = NetCmd::Video {

@@ -13,6 +13,7 @@ use reemoth_proto::signal::{ErrorCode, HostId, Role, SessionId, SignalMsg};
 use tokio::sync::mpsc;
 
 use crate::config::ConfigFile;
+use crate::monitor;
 use crate::signal_client::{SignalConn, SignalTx};
 use crate::stream::{self, StreamControl};
 
@@ -43,6 +44,9 @@ struct Shared {
     /// One password check at a time, so parallel sessions cannot each take
     /// a guess before any failure is recorded.
     attempt: Arc<tokio::sync::Semaphore>,
+    /// The session currently streaming. Windows allows one capture of a
+    /// display per process, so a new viewer takes it over.
+    active_stream: Arc<Mutex<Option<Arc<StreamControl>>>>,
 }
 
 pub async fn run(cfg: &mut ConfigFile, opts: HostOptions) -> anyhow::Result<()> {
@@ -51,6 +55,7 @@ pub async fn run(cfg: &mut ConfigFile, opts: HostOptions) -> anyhow::Result<()> 
     };
     let lockout = Arc::new(Mutex::new(Lockout::default()));
     let attempt = Arc::new(tokio::sync::Semaphore::new(1));
+    let active_stream = Arc::new(Mutex::new(None));
     let mut backoff = Duration::from_secs(1);
     loop {
         let (id, identity) = cfg.host_identity()?;
@@ -60,6 +65,7 @@ pub async fn run(cfg: &mut ConfigFile, opts: HostOptions) -> anyhow::Result<()> 
             secret: secret.clone(),
             lockout: lockout.clone(),
             attempt: attempt.clone(),
+            active_stream: active_stream.clone(),
         });
 
         match register(&opts.signal_url, id, &identity).await {
@@ -165,7 +171,7 @@ async fn handle_session(
         })
     };
 
-    let Ok(_permit) = shared.attempt.clone().try_acquire_owned() else {
+    let Ok(permit) = shared.attempt.clone().try_acquire_owned() else {
         relay(PeerMsg::Denied {
             reason: "another login attempt is in progress; try again in a few seconds".into(),
             retry_after_secs: Some(5),
@@ -205,6 +211,8 @@ async fn handle_session(
         .lock()
         .expect("lockout lock")
         .record_success();
+    // Only the password check is serialized; the session itself runs alongside others.
+    drop(permit);
     println!("[{tag}] password accepted");
     signal.send(SignalMsg::Authorize { session })?;
     relay(PeerMsg::AuthOk {
@@ -229,18 +237,22 @@ async fn handle_session(
         sdp: answer,
     })?;
 
-    run_peer(prepared, &tag).await
+    run_peer(prepared, &tag, shared).await
 }
 
 /// Serves one connected client: answers pings, prints chat, measures bulk.
 /// Serves one connected client: streams the screen if it asked for video,
 /// answers pings, prints chat, measures bulk transfers.
-async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
+async fn run_peer(prepared: Prepared, tag: &str, shared: &Shared) -> anyhow::Result<()> {
     let mut peer = prepared.spawn();
     let mut ctrl = None;
     let mut bulk: Option<(u64, u64, Instant)> = None; // (expected, received, start)
     let mut streaming: Option<(Arc<StreamControl>, std::thread::JoinHandle<()>)> = None;
     let mut stats_tick = tokio::time::interval(Duration::from_secs(1));
+    // Host-side numbers of the last second, printed next to the viewer's report.
+    let mut last_host: Option<stream::Stats> = None;
+    // Snapshot being received: (width, height, bytes so far).
+    let mut pending_snapshot: Option<(u32, u32, Vec<u8>)> = None;
     let result = loop {
         let event = tokio::select! {
             ev = peer.recv() => match ev {
@@ -250,6 +262,7 @@ async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
             _ = stats_tick.tick() => {
                 if let (Some((control, _)), Some(id)) = (&streaming, ctrl) {
                     let s = control.take_stats();
+                    last_host = Some(s.clone());
                     let msg = CtrlMsg::HostStats {
                         width: s.width,
                         height: s.height,
@@ -267,8 +280,20 @@ async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
         };
         match event {
             NetEvent::VideoReady if streaming.is_none() => {
-                println!("[{tag}] streaming the screen");
+                println!(
+                    "[{tag}] streaming the screen (viewer snapshots: {})",
+                    monitor::snapshot_path(tag).display()
+                );
                 let control = Arc::new(StreamControl::default());
+                let previous = shared
+                    .active_stream
+                    .lock()
+                    .expect("active stream lock")
+                    .replace(control.clone());
+                if let Some(previous) = previous {
+                    println!("[{tag}] taking over the screen from an earlier session");
+                    previous.stop();
+                }
                 let handle = stream::spawn(peer.sender(), control.clone());
                 streaming = Some((control, handle));
             }
@@ -277,11 +302,7 @@ async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
                     control.request_keyframe();
                 }
             }
-            NetEvent::BitrateEstimate(bps) => {
-                if let Some((control, _)) = &streaming {
-                    control.set_available_bandwidth(bps);
-                }
-            }
+            NetEvent::BitrateEstimate(_) => {}
             NetEvent::Connected(path) => println!(
                 "[{tag}] connected: {}  ({} <-> {})",
                 path.kind, path.local, path.remote
@@ -306,6 +327,26 @@ async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
                     }
                     CtrlMsg::Chat { text } => println!("[{tag}] says: {text}"),
                     CtrlMsg::BulkStart { bytes } => bulk = Some((bytes, 0, Instant::now())),
+                    report @ CtrlMsg::ViewerStats { .. } => {
+                        if let (
+                            Some((control, _)),
+                            CtrlMsg::ViewerStats {
+                                gaps,
+                                keyframe_requests,
+                                ..
+                            },
+                        ) = (&streaming, &report)
+                        {
+                            control.on_viewer_report(*gaps > 0 || *keyframe_requests > 0);
+                        }
+                        println!(
+                            "[{tag}] {}",
+                            monitor::stats_line(last_host.as_ref(), &report)
+                        );
+                    }
+                    CtrlMsg::Snapshot { width, height } => {
+                        pending_snapshot = Some((width, height, Vec::new()));
+                    }
                     _ => {}
                 }
             }
@@ -314,6 +355,20 @@ async fn run_peer(prepared: Prepared, tag: &str) -> anyhow::Result<()> {
                 binary: true,
                 data,
             } if Some(id) == ctrl => {
+                if let Some((w, h, buf)) = &mut pending_snapshot {
+                    buf.extend_from_slice(&data);
+                    let expected = monitor::snapshot_len(*w, *h);
+                    if buf.len() >= expected {
+                        match monitor::save_snapshot(tag, *w, *h, buf) {
+                            Ok(path) => {
+                                tracing::info!("[{tag}] viewer snapshot: {}", path.display())
+                            }
+                            Err(e) => eprintln!("[{tag}] could not save viewer snapshot: {e:#}"),
+                        }
+                        pending_snapshot = None;
+                    }
+                    continue;
+                }
                 if let Some((expected, received, start)) = &mut bulk {
                     *received += data.len() as u64;
                     if *received >= *expected {

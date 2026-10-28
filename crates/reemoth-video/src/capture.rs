@@ -80,7 +80,20 @@ impl DesktopCapture {
         .context("creating D3D11 device")?;
         let device = device.context("no D3D11 device")?;
         let context = context.context("no D3D11 context")?;
-        let duplication = duplicate(&output, &device)?;
+        // Fails while another capture of this display is still open (e.g. a
+        // previous session winding down), so retry for a while.
+        let mut attempt = 0;
+        let duplication = loop {
+            match duplicate(&output, &device) {
+                Ok(d) => break d,
+                Err(e) if attempt < 40 => {
+                    tracing::debug!("desktop duplication busy, retrying: {e:#}");
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let desc = unsafe { duplication.GetDesc() };
         Ok(Self {
             device,

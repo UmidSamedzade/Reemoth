@@ -47,7 +47,15 @@ struct ViewStats {
     /// Arrival of the first packet → picture ready to draw.
     pipeline_time: Duration,
     keyframe_requests: u32,
+    gaps: u32,
+    max_stall: Duration,
 }
+
+/// How often the viewer sends the host a small copy of what it shows.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(15);
+/// Snapshot = every Nth pixel of the picture (1080p → 480×270).
+const SNAPSHOT_STEP: usize = 4;
+const SNAPSHOT_CHUNK: usize = 16 * 1024;
 
 pub fn run(rt: Runtime, target: Target) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
@@ -213,7 +221,7 @@ async fn network(
         let (shared, proxy, net_tx) = (shared.clone(), proxy.clone(), net_tx.clone());
         std::thread::Builder::new()
             .name("reemoth-decode".into())
-            .spawn(move || decode_loop(frames_rx, shared, proxy, net_tx))
+            .spawn(move || decode_loop(frames_rx, shared, proxy, net_tx, ctrl))
             .context("spawning decoder thread")?;
     }
 
@@ -224,6 +232,7 @@ async fn network(
     let mut host: Option<CtrlMsg> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut first_frame = true;
+    let mut last_arrival: Option<Instant> = None;
     loop {
         tokio::select! {
             ev = peer.recv() => match ev {
@@ -232,7 +241,15 @@ async fn network(
                         println!("Receiving video");
                         first_frame = false;
                     }
-                    shared.stats.lock().expect("stats lock").bytes += data.len() as u64;
+                    {
+                        let mut s = shared.stats.lock().expect("stats lock");
+                        s.bytes += data.len() as u64;
+                        s.gaps += u32::from(!contiguous);
+                        if let Some(prev) = last_arrival {
+                            s.max_stall = s.max_stall.max(arrived.saturating_duration_since(prev));
+                        }
+                    }
+                    last_arrival = Some(arrived);
                     if frames_tx.send(EncodedIn { data, keyframe, contiguous, arrived }).is_err() {
                         anyhow::bail!("decoder stopped");
                     }
@@ -258,8 +275,9 @@ async fn network(
                 ping_seq += 1;
                 ping_sent = Some((ping_seq, Instant::now()));
                 send_ctrl(&net_tx, ctrl, &CtrlMsg::Ping { seq: ping_seq }).await;
-                let status = status_line(&shared, rtt, host.as_ref(), path_kind);
+                let (status, report) = status_line(&shared, rtt, host.as_ref(), path_kind);
                 let _ = proxy.send_event(UserEvent::Status(status));
+                send_ctrl(&net_tx, ctrl, &report).await;
             }
         }
     }
@@ -280,7 +298,10 @@ fn decode_loop(
     shared: Arc<Shared>,
     proxy: EventLoopProxy<UserEvent>,
     net: mpsc::Sender<NetCmd>,
+    ctrl: ChannelId,
 ) {
+    // First snapshot a few seconds in, once the picture has settled.
+    let mut next_snapshot = Instant::now() + Duration::from_secs(3);
     let mut decoder = match Decoder::new() {
         Ok(d) => d,
         Err(e) => {
@@ -312,6 +333,10 @@ fn decode_loop(
                     s.decode_time += decoded;
                     s.pipeline_time += f.arrived.elapsed();
                 }
+                if Instant::now() >= next_snapshot {
+                    next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
+                    send_snapshot(&net, ctrl, &out);
+                }
                 // Hand the picture to the window; reuse whatever it left behind.
                 let previous = shared.mailbox.lock().expect("mailbox lock").replace(out);
                 out = previous.unwrap_or_else(|| I420Frame::new(2, 2));
@@ -328,14 +353,72 @@ fn decode_loop(
     }
 }
 
+/// Downscales `frame` by sampling and queues it for the host. Best effort:
+/// dropped if the session queue is full.
+fn send_snapshot(net: &mpsc::Sender<NetCmd>, ctrl: ChannelId, frame: &I420Frame) {
+    let (w, h) = (
+        (frame.width / SNAPSHOT_STEP) & !1,
+        (frame.height / SNAPSHOT_STEP) & !1,
+    );
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut data = Vec::with_capacity(w * h * 3 / 2);
+    for y in 0..h {
+        let row = y * SNAPSHOT_STEP * frame.width;
+        data.extend((0..w).map(|x| frame.y[row + x * SNAPSHOT_STEP]));
+    }
+    let cw = frame.width / 2;
+    for plane in [&frame.u, &frame.v] {
+        for y in 0..h / 2 {
+            let row = y * SNAPSHOT_STEP * cw;
+            data.extend((0..w / 2).map(|x| plane[row + x * SNAPSHOT_STEP]));
+        }
+    }
+    let header = CtrlMsg::Snapshot {
+        width: w as u32,
+        height: h as u32,
+    };
+    let header = NetCmd::Send {
+        id: ctrl,
+        binary: false,
+        data: header.encode().into_bytes(),
+    };
+    // Chunked: one data-channel message must stay well under SCTP's limit.
+    if net.try_send(header).is_ok() {
+        for chunk in data.chunks(SNAPSHOT_CHUNK) {
+            let cmd = NetCmd::Send {
+                id: ctrl,
+                binary: true,
+                data: chunk.to_vec(),
+            };
+            if net.try_send(cmd).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Builds the title-bar line and the report for the host, then resets the counters.
 fn status_line(
     shared: &Shared,
     rtt: Option<Duration>,
     host: Option<&CtrlMsg>,
     path: PathKind,
-) -> String {
+) -> (String, CtrlMsg) {
     let mut s = shared.stats.lock().expect("stats lock");
     let decoded = s.frames_decoded.max(1);
+    let report = CtrlMsg::ViewerStats {
+        fps: s.frames_drawn,
+        decoded: s.frames_decoded,
+        kbps: (s.bytes * 8 / 1000) as u32,
+        decode_ms: s.decode_time.as_secs_f32() * 1e3 / decoded as f32,
+        ready_ms: s.pipeline_time.as_secs_f32() * 1e3 / decoded as f32,
+        keyframe_requests: s.keyframe_requests,
+        gaps: s.gaps,
+        max_stall_ms: s.max_stall.as_millis() as u32,
+        rtt_ms: rtt.map(|r| r.as_millis() as u32),
+    };
     let mut parts = vec![
         format!("{} fps", s.frames_drawn),
         format!("{:.1} Mbit/s", s.bytes as f64 * 8.0 / 1e6),
@@ -374,6 +457,9 @@ fn status_line(
     if s.keyframe_requests > 0 {
         parts.push(format!("{} keyframe requests", s.keyframe_requests));
     }
+    if s.gaps > 0 {
+        parts.push(format!("{} gaps", s.gaps));
+    }
     *s = ViewStats::default();
-    parts.join(" · ")
+    (parts.join(" · "), report)
 }

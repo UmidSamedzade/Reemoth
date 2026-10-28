@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod host;
+mod monitor;
 mod render;
 mod signal_client;
 mod stream;

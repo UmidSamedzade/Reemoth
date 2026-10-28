@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use str0m::bwe::{Bitrate, BweKind};
+use str0m::bwe::BweKind;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
@@ -34,14 +34,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Stop taking app sends while this much is queued inside the session.
 const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
+/// Largest single data-channel message we send; split anything bigger.
+pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
 /// str0m's SCTP buffer level above which we hold sends back.
 const CHANNEL_HIGH_WATER: usize = 1024 * 1024;
-/// Bandwidth estimation starts here and probes up towards `VIDEO_MAX_BITRATE`.
-const VIDEO_START_BITRATE: Bitrate = Bitrate::mbps(4);
-const VIDEO_MAX_BITRATE: Bitrate = Bitrate::mbps(25);
 /// Packets str0m waits on for a gap before giving up on in-order delivery.
 /// Must exceed the packet count of the largest keyframe (~250 at 1080p).
 const VIDEO_REORDER_PACKETS: usize = 500;
+/// How long an incomplete frame waits for missing packets (retransmissions)
+/// before it is dropped and a keyframe is requested. str0m's default is 2 s,
+/// which shows up as a 2 s freeze on every loss. The clock starts at the
+/// frame's first packet, so this must also cover pacing out a large
+/// keyframe; too short and every keyframe is dropped as incomplete.
+const VIDEO_REORDER_TIMEOUT: Duration = Duration::from_millis(400);
 /// Packets kept for answering retransmission requests.
 const VIDEO_SEND_BUFFER: usize = 2000;
 /// Don't ask the sender for keyframes more often than this.
@@ -138,6 +143,7 @@ pub struct Prepared {
     gathered: Gathered,
     remote_relays: HashSet<SocketAddr>,
     remote_ips: Vec<IpAddr>,
+    video_recv: Option<Mid>,
 }
 
 impl Prepared {
@@ -145,8 +151,11 @@ impl Prepared {
         let mut rtc = Rtc::builder()
             .clear_codecs()
             .enable_h264(true)
-            .enable_bwe(Some(VIDEO_START_BITRATE))
+            // No GCC pacing for now: its estimate starved 1080p keyframes even
+            // on loopback. The app adapts the bitrate from viewer loss reports.
+            .enable_bwe(None)
             .set_reordering_size_video(VIDEO_REORDER_PACKETS)
+            .set_reordering_timeout_video(Some(VIDEO_REORDER_TIMEOUT))
             .set_send_buffer_video(VIDEO_SEND_BUFFER)
             .build(Instant::now());
         for c in &gathered.candidates {
@@ -157,6 +166,7 @@ impl Prepared {
             gathered,
             remote_relays: HashSet::new(),
             remote_ips: Vec::new(),
+            video_recv: None,
         }
     }
 
@@ -172,7 +182,10 @@ impl Prepared {
             api.add_channel((*label).to_owned());
         }
         if receive_video {
-            api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+            // str0m does not announce our own track via MediaAdded, so keep its mid
+            // here; keyframe requests need it.
+            self.video_recv =
+                Some(api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None));
         }
         let (offer, pending) = api.apply().context("nothing to offer")?;
         Ok((offer.to_sdp_string(), pending))
@@ -229,7 +242,7 @@ impl Prepared {
             disconnected_since: None,
             started: Instant::now(),
             video_send: None,
-            video_recv: None,
+            video_recv: self.video_recv,
             video_ready_sent: false,
             last_keyframe_request: None,
         };
@@ -360,6 +373,10 @@ impl Driver {
                     if let Some((n, from)) = r { self.receive(from, false, &buf6[..n]); }
                 }
                 cmd = cmds.recv(), if accept_cmds => match cmd {
+                    Some(NetCmd::Send { data, .. }) if data.len() > MAX_MESSAGE_LEN => {
+                        // It would sit at the head of the queue forever.
+                        tracing::warn!("dropping a {} byte data-channel message (max {MAX_MESSAGE_LEN})", data.len());
+                    }
                     Some(NetCmd::Send { id, binary, data }) => {
                         self.queued_bytes += data.len();
                         self.queued.entry(id).or_default().push_back((binary, data));
@@ -546,14 +563,18 @@ impl Driver {
         {
             return;
         }
-        let Some(mid) = self.video_recv else { return };
+        let Some(mid) = self.video_recv else {
+            tracing::debug!("keyframe request: no receiving video track");
+            return;
+        };
         if let Some(mut writer) = self.rtc.writer(mid) {
             // Fails until the first packet arrives; the sender starts with a keyframe anyway.
-            if writer
-                .request_keyframe(None, KeyframeRequestKind::Pli)
-                .is_ok()
-            {
-                self.last_keyframe_request = Some(now);
+            match writer.request_keyframe(None, KeyframeRequestKind::Pli) {
+                Ok(()) => {
+                    tracing::debug!("sent PLI");
+                    self.last_keyframe_request = Some(now);
+                }
+                Err(e) => tracing::debug!("keyframe request failed: {e}"),
             }
         }
     }
@@ -582,7 +603,6 @@ impl Driver {
     fn maybe_video_ready(&mut self) {
         if self.connected && self.video_send.is_some() && !self.video_ready_sent {
             self.video_ready_sent = true;
-            self.rtc.bwe().set_desired_bitrate(VIDEO_MAX_BITRATE);
             let _ = self.events.send(NetEvent::VideoReady);
         }
     }
@@ -616,7 +636,8 @@ impl Driver {
                     arrived: d.network_time,
                 });
             }
-            Event::KeyframeRequest(_) => {
+            Event::KeyframeRequest(r) => {
+                tracing::debug!("peer requested a keyframe: {:?}", r.kind);
                 let _ = self.events.send(NetEvent::KeyframeRequested);
             }
             Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. })

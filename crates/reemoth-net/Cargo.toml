@@ -15,6 +15,7 @@ getrandom = "0.2"
 hmac = "0.12"
 md-5 = "0.10"
 sha1 = "0.10"
+socket2 = "0.6"
 str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
 tokio = { workspace = true, features = ["net", "sync"] }
 tracing.workspace = true

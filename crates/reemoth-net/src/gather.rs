@@ -243,12 +243,33 @@ async fn bind(ip: Option<IpAddr>) -> Option<(Arc<UdpSocket>, SocketAddr)> {
     let any: SocketAddr = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
         .parse()
         .expect("valid literal");
-    let sock = UdpSocket::bind(any)
-        .await
+    let sock = bind_large(any)
         .map_err(|e| tracing::warn!("binding {any} failed: {e}"))
         .ok()?;
     let port = sock.local_addr().ok()?.port();
     Some((Arc::new(sock), SocketAddr::new(ip, port)))
+}
+
+/// Socket buffer size. A 1080p keyframe arrives as a burst of 100+ packets;
+/// Windows' default receive buffer (~64 KB) overflows and drops them.
+const SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
+fn bind_large(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    // The OS may clamp these (Linux: net.core.rmem_max); smaller is still better than default.
+    if let Err(e) = socket.set_recv_buffer_size(SOCKET_BUFFER) {
+        tracing::debug!("SO_RCVBUF: {e}");
+    }
+    if let Err(e) = socket.set_send_buffer_size(SOCKET_BUFFER) {
+        tracing::debug!("SO_SNDBUF: {e}");
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    UdpSocket::from_std(socket.into())
 }
 
 /// The local IP the OS would use to reach the internet. `connect` on UDP

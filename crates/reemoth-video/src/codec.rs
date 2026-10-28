@@ -53,8 +53,9 @@ impl Encoder {
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(settings.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(settings.max_fps))
-            // Skipping frames when over budget is what keeps latency flat.
-            .skip_frames(true)
+            // Never skip: a skipped keyframe leaves the viewer with nothing to
+            // decode. Over-budget frames get coarser quantization instead.
+            .skip_frames(false)
             .complexity(Complexity::Low)
             .qp(QpRange::new(10, 40))
             // No periodic keyframes: they are bitrate spikes. The viewer asks

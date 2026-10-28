@@ -24,6 +24,8 @@ pub struct StreamControl {
     keyframe: AtomicBool,
     bitrate: AtomicU32,
     pub stats: Mutex<Stats>,
+    /// The streamed display's place on the desktop, for input mapping.
+    pub desktop: Mutex<Option<reemoth_input::ScreenRect>>,
 }
 
 #[derive(Default, Clone)]
@@ -58,6 +60,10 @@ impl StreamControl {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Returns and resets the per-second counters.
@@ -120,6 +126,18 @@ mod platform {
 
     pub fn run(tx: &mpsc::Sender<NetCmd>, control: &StreamControl) -> anyhow::Result<()> {
         let mut capture = DesktopCapture::primary()?;
+        let publish_rect = |capture: &DesktopCapture| {
+            *control.desktop.lock().expect("desktop lock") =
+                capture.desktop_rect().map(|(left, top, width, height)| {
+                    reemoth_input::ScreenRect {
+                        left,
+                        top,
+                        width,
+                        height,
+                    }
+                });
+        };
+        publish_rect(&capture);
         let (w, h) = capture.size();
         let mut allow_hw = std::env::var_os("REEMOTH_SOFTWARE_ENCODER").is_none();
         let (first, mut interval) = open_encoder(w, h, control, allow_hw)?;
@@ -178,6 +196,7 @@ mod platform {
                 drop(encoder.take());
                 let (e, i) = open_encoder(fw, fh, control, allow_hw)?;
                 (encoder, interval, encoder_size) = (Some(e), i, (fw, fh));
+                publish_rect(&capture);
                 control.keyframe.store(true, Ordering::Relaxed);
                 continue;
             }

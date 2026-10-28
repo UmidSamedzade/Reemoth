@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use str0m::bwe::BweKind;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
-use str0m::channel::ChannelId;
+use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 use str0m::format::Codec;
 use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
@@ -172,14 +172,25 @@ impl Prepared {
 
     /// Offerer: creates data channels named `labels` (and a receive-only
     /// video track if `receive_video`) and returns the offer SDP.
+    /// `lossy` channels are unordered with no retransmissions: for data
+    /// where only the newest message matters (pointer position).
     pub fn create_offer(
         &mut self,
         labels: &[&str],
+        lossy: &[&str],
         receive_video: bool,
     ) -> anyhow::Result<(String, SdpPendingOffer)> {
         let mut api = self.rtc.sdp_api();
         for label in labels {
             api.add_channel((*label).to_owned());
+        }
+        for label in lossy {
+            api.add_channel_with_config(ChannelConfig {
+                label: (*label).to_owned(),
+                ordered: false,
+                reliability: Reliability::MaxRetransmits { retransmits: 0 },
+                ..Default::default()
+            });
         }
         if receive_video {
             // str0m does not announce our own track via MediaAdded, so keep its mid

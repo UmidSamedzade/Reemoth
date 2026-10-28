@@ -8,7 +8,7 @@ use reemoth_auth::{ClientPake, PasswordSecret, SessionKeys, b64, unb64};
 use reemoth_net::ChannelId;
 use reemoth_net::gather::GatherOptions;
 use reemoth_net::{NetEvent, PathInfo, PeerConnection, Prepared, gather};
-use reemoth_proto::peer::{CtrlMsg, PeerMsg};
+use reemoth_proto::peer::{CtrlMsg, INPUT_CHANNEL, PeerMsg};
 use reemoth_proto::signal::{HostId, IceServer, Role, SessionId, SignalMsg};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -32,7 +32,8 @@ pub struct ConnectOptions {
 }
 
 pub async fn run(opts: ConnectOptions) -> anyhow::Result<()> {
-    let (mut peer, ctrl, _) = establish(&opts.target, false, &|line| println!("{line}")).await?;
+    let (mut peer, Channels { ctrl, .. }, _) =
+        establish(&opts.target, false, &|line| println!("{line}")).await?;
     if opts.pings > 0 {
         ping_test(&mut peer, ctrl, opts.pings).await?;
     }
@@ -52,7 +53,7 @@ pub async fn establish(
     target: &Target,
     receive_video: bool,
     log: &(dyn Fn(&str) + Sync),
-) -> anyhow::Result<(PeerConnection, ChannelId, PathInfo)> {
+) -> anyhow::Result<(PeerConnection, Channels, PathInfo)> {
     let started = Instant::now();
     let mut conn = SignalConn::connect(&target.signal_url, target.id, Role::Client).await?;
     log(&format!("Contacting host {} ...", target.id.grouped()));
@@ -71,7 +72,7 @@ pub async fn establish(
         log(&format!("  local candidate: {c}"));
     }
     let mut prepared = Prepared::new(gathered);
-    let (offer, pending) = prepared.create_offer(&["ctrl"], receive_video)?;
+    let (offer, pending) = prepared.create_offer(&["ctrl"], &[INPUT_CHANNEL], receive_video)?;
     conn.send(SignalMsg::Relay {
         session,
         payload: PeerMsg::Offer {
@@ -90,8 +91,8 @@ pub async fn establish(
     drop(conn);
 
     let mut peer = prepared.spawn();
-    let (ctrl, path) = wait_connected(&mut peer, started, log).await?;
-    Ok((peer, ctrl, path))
+    let (channels, path) = wait_connected(&mut peer, started, log).await?;
+    Ok((peer, channels, path))
 }
 
 async fn authenticate(
@@ -154,14 +155,24 @@ fn denied(msg: PeerMsg) -> anyhow::Error {
     }
 }
 
+/// The data channels every session opens.
+#[derive(Debug, Clone, Copy)]
+pub struct Channels {
+    /// Reliable, ordered: control messages, keys, clicks, clipboard.
+    pub ctrl: ChannelId,
+    /// Unreliable: pointer position.
+    pub input: ChannelId,
+}
+
 async fn wait_connected(
     peer: &mut PeerConnection,
     started: Instant,
     log: &(dyn Fn(&str) + Sync),
-) -> anyhow::Result<(ChannelId, PathInfo)> {
+) -> anyhow::Result<(Channels, PathInfo)> {
     let mut ctrl = None;
+    let mut input = None;
     let mut connected = None;
-    while !(connected.is_some() && ctrl.is_some()) {
+    while !(connected.is_some() && ctrl.is_some() && input.is_some()) {
         match peer.recv().await {
             Some(NetEvent::Connected(path)) => {
                 log("");
@@ -175,15 +186,17 @@ async fn wait_connected(
                 connected = Some(path);
             }
             Some(NetEvent::ChannelOpen { id, label }) if label == "ctrl" => ctrl = Some(id),
+            Some(NetEvent::ChannelOpen { id, label }) if label == INPUT_CHANNEL => input = Some(id),
             Some(NetEvent::Closed(reason)) => bail!("{reason}"),
             Some(_) => {}
             None => bail!("session ended"),
         }
     }
-    Ok((
-        ctrl.expect("loop exits with a channel"),
-        connected.expect("loop exits connected"),
-    ))
+    let channels = Channels {
+        ctrl: ctrl.expect("loop exits with ctrl"),
+        input: input.expect("loop exits with input"),
+    };
+    Ok((channels, connected.expect("loop exits connected")))
 }
 
 async fn ping_test(peer: &mut PeerConnection, ctrl: ChannelId, count: u32) -> anyhow::Result<()> {

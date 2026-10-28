@@ -4,30 +4,43 @@
 //! network session runs on the tokio runtime; H.264 decoding has its own
 //! thread so a slow frame never stalls packet handling. Decoded frames go
 //! through a one-slot mailbox, so the window always shows the newest one.
+//!
+//! Input: the pointer position goes on the unreliable `input` channel
+//! (newest wins); clicks, keys and wheel on the reliable `ctrl` channel.
+//! The pointer itself is this machine's own cursor, drawn by the local
+//! compositor with zero latency, in the shape the host reports.
+//! Ctrl+Alt+F toggles fullscreen; every other key goes to the host.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use reemoth_net::{ChannelId, NetCmd, NetEvent, PathKind};
-use reemoth_proto::peer::CtrlMsg;
+use reemoth_proto::peer::{CtrlMsg, MouseButton, PointerMove};
 use reemoth_video::{Decoder, I420Frame};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
-use crate::client::{Target, establish};
+use crate::client::{Channels, Target, establish};
 use crate::render::Renderer;
 
 enum UserEvent {
     /// A new decoded frame is in the mailbox.
     Frame,
     Status(String),
+    /// The host's pointer shape (CSS name) and visibility.
+    Cursor(String, bool),
     Closed(String),
+}
+
+pub struct ViewOptions {
+    pub clipboard: bool,
 }
 
 #[derive(Default)]
@@ -36,6 +49,11 @@ struct Shared {
     mailbox: Mutex<Option<I420Frame>>,
     stats: Mutex<ViewStats>,
     net: Mutex<Option<mpsc::Sender<NetCmd>>>,
+    channels: Mutex<Option<Channels>>,
+    /// Control-channel input from the window. Unbounded and forwarded in
+    /// order by a task that waits for room, so a key or button release is
+    /// never dropped (a lost release is a stuck key on the host).
+    ctrl_out: Mutex<Option<mpsc::UnboundedSender<CtrlMsg>>>,
 }
 
 #[derive(Default)]
@@ -57,7 +75,7 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(15);
 const SNAPSHOT_STEP: usize = 4;
 const SNAPSHOT_CHUNK: usize = 16 * 1024;
 
-pub fn run(rt: Runtime, target: Target) -> anyhow::Result<()> {
+pub fn run(rt: Runtime, target: Target, opts: ViewOptions) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("opening a window (is a display server running?)")?;
@@ -67,7 +85,7 @@ pub fn run(rt: Runtime, target: Target) -> anyhow::Result<()> {
     {
         let (proxy, shared) = (proxy.clone(), shared.clone());
         rt.spawn(async move {
-            let reason = match network(target, proxy.clone(), shared).await {
+            let reason = match network(target, opts, proxy.clone(), shared).await {
                 Ok(()) => "session ended".to_owned(),
                 Err(e) => format!("{e:#}"),
             };
@@ -81,6 +99,11 @@ pub fn run(rt: Runtime, target: Target) -> anyhow::Result<()> {
         renderer: None,
         error: None,
         closed: None,
+        pointer: None,
+        last_pointer: (0.5, 0.5),
+        pointer_seq: 0,
+        held: HashSet::new(),
+        modifiers: ModifiersState::empty(),
     };
     event_loop.run_app(&mut app)?;
     // Let the session send its goodbye before the runtime is torn down.
@@ -101,6 +124,69 @@ struct App {
     renderer: Option<Renderer>,
     error: Option<anyhow::Error>,
     closed: Option<String>,
+    /// Pointer position over the picture, normalized (0..1); `None` over
+    /// the black bars or outside the window.
+    pointer: Option<(f32, f32)>,
+    /// Last position sent, clamped to the picture: where releases land.
+    last_pointer: (f32, f32),
+    pointer_seq: u32,
+    /// Buttons pressed on the host through this viewer.
+    held: HashSet<MouseButton>,
+    modifiers: ModifiersState,
+}
+
+impl App {
+    fn send_ctrl(&self, msg: CtrlMsg) {
+        if let Some(tx) = self.shared.ctrl_out.lock().expect("ctrl lock").as_ref() {
+            let _ = tx.send(msg);
+        }
+    }
+
+    fn pointer_moved(&mut self, wx: f64, wy: f64) {
+        let Some((left, top, w, h)) = self.renderer.as_ref().and_then(Renderer::picture_rect)
+        else {
+            return;
+        };
+        let (mut x, mut y) = (((wx - left) / w) as f32, ((wy - top) / h) as f32);
+        let inside = (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y);
+        if !inside {
+            if self.held.is_empty() {
+                // Over the black bars: nothing to point at.
+                self.pointer = None;
+                return;
+            }
+            // Mid-drag: keep following, pinned to the screen edge.
+            (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+        }
+        self.pointer = Some((x, y));
+        self.last_pointer = (x, y);
+        self.pointer_seq = self.pointer_seq.wrapping_add(1);
+        let (Some(tx), Some(ch)) = (
+            self.shared.net.lock().expect("net lock").clone(),
+            *self.shared.channels.lock().expect("channels lock"),
+        ) else {
+            return;
+        };
+        let seq = self.pointer_seq;
+        let data = serde_json::to_vec(&PointerMove { x, y, seq }).expect("serializes");
+        // Lossy on purpose: a newer position is always on its way.
+        let _ = tx.try_send(NetCmd::Send {
+            id: ch.input,
+            binary: false,
+            data,
+        });
+    }
+
+    fn toggle_fullscreen(&self) {
+        if let Some(w) = &self.window {
+            let next = if w.fullscreen().is_some() {
+                None
+            } else {
+                Some(Fullscreen::Borderless(None))
+            };
+            w.set_fullscreen(next);
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -143,6 +229,13 @@ impl ApplicationHandler<UserEvent> for App {
                     w.set_title(&format!("{} — {s}", self.title));
                 }
             }
+            UserEvent::Cursor(shape, visible) => {
+                if let Some(w) = &self.window {
+                    let icon = shape.parse::<CursorIcon>().unwrap_or_default();
+                    w.set_cursor(icon);
+                    w.set_cursor_visible(visible);
+                }
+            }
             UserEvent::Closed(reason) => {
                 self.closed = Some(reason);
                 event_loop.exit();
@@ -163,24 +256,72 @@ impl ApplicationHandler<UserEvent> for App {
                     r.resize(size.width, size.height);
                 }
             }
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        logical_key: Key::Named(NamedKey::F11),
-                        state: ElementState::Pressed,
-                        repeat: false,
+                        physical_key: PhysicalKey::Code(code),
+                        state,
                         ..
                     },
                 ..
             } => {
-                if let Some(w) = &self.window {
-                    let next = if w.fullscreen().is_some() {
-                        None
-                    } else {
-                        Some(Fullscreen::Borderless(None))
-                    };
-                    w.set_fullscreen(next);
+                let down = state == ElementState::Pressed;
+                if code == KeyCode::KeyF
+                    && down
+                    && self.modifiers.control_key()
+                    && self.modifiers.alt_key()
+                {
+                    self.toggle_fullscreen();
+                    return;
                 }
+                if let Some(code) = w3c_code(code) {
+                    // Repeats are forwarded too: injected keys don't auto-repeat.
+                    self.send_ctrl(CtrlMsg::Key { code, down });
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => self.pointer_moved(position.x, position.y),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button = match button {
+                    winit::event::MouseButton::Left => MouseButton::Left,
+                    winit::event::MouseButton::Right => MouseButton::Right,
+                    winit::event::MouseButton::Middle => MouseButton::Middle,
+                    winit::event::MouseButton::Back => MouseButton::Back,
+                    winit::event::MouseButton::Forward => MouseButton::Forward,
+                    winit::event::MouseButton::Other(_) => return,
+                };
+                let down = state == ElementState::Pressed;
+                let (x, y) = if down {
+                    // A press needs a spot on the picture.
+                    let Some(p) = self.pointer else { return };
+                    self.held.insert(button);
+                    p
+                } else {
+                    // Release only what we pressed, where the pointer last was.
+                    if !self.held.remove(&button) {
+                        return;
+                    }
+                    self.last_pointer
+                };
+                self.send_ctrl(CtrlMsg::MouseButton { x, y, button, down });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    // One line = one notch.
+                    // winit's positive x scrolls left; Windows' positive HWHEEL scrolls right.
+                    MouseScrollDelta::LineDelta(x, y) => (-x * 120.0, y * 120.0),
+                    // Touchpads: ~3 lines of ~16 px per notch.
+                    MouseScrollDelta::PixelDelta(p) => ((-p.x * 2.5) as f32, (p.y * 2.5) as f32),
+                };
+                if self.pointer.is_some() {
+                    self.send_ctrl(CtrlMsg::Wheel { dx, dy });
+                }
+            }
+            WindowEvent::Focused(false) => {
+                // Keys held while focus leaves would never see their release.
+                self.send_ctrl(CtrlMsg::ReleaseInput);
+                self.modifiers = ModifiersState::empty();
+                self.held.clear();
             }
             WindowEvent::RedrawRequested => {
                 let frame = self.shared.mailbox.lock().expect("mailbox lock").take();
@@ -209,12 +350,32 @@ struct EncodedIn {
 
 async fn network(
     target: Target,
+    opts: ViewOptions,
     proxy: EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,
 ) -> anyhow::Result<()> {
-    let (mut peer, ctrl, path) = establish(&target, true, &|line| println!("{line}")).await?;
+    let (mut peer, channels, path) = establish(&target, true, &|line| println!("{line}")).await?;
+    let ctrl = channels.ctrl;
     let net_tx = peer.sender();
     *shared.net.lock().expect("net lock") = Some(net_tx.clone());
+    *shared.channels.lock().expect("channels lock") = Some(channels);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<CtrlMsg>();
+    *shared.ctrl_out.lock().expect("ctrl lock") = Some(ctrl_tx);
+    {
+        let net_tx = net_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = ctrl_rx.recv().await {
+                send_ctrl(&net_tx, ctrl, &msg).await;
+            }
+        });
+    }
+    let mut clipboard = if opts.clipboard {
+        crate::clipboard::spawn()
+            .map_err(|e| eprintln!("clipboard sync off: {e:#}"))
+            .ok()
+    } else {
+        None
+    };
 
     let (frames_tx, frames_rx) = std_mpsc::channel::<EncodedIn>();
     {
@@ -263,6 +424,14 @@ async fn network(
                             }
                         }
                         Ok(stats @ CtrlMsg::HostStats { .. }) => host = Some(stats),
+                        Ok(CtrlMsg::Cursor { shape, visible }) => {
+                            let _ = proxy.send_event(UserEvent::Cursor(shape, visible));
+                        }
+                        Ok(CtrlMsg::Clipboard { text }) => {
+                            if let Some(c) = &clipboard {
+                                let _ = c.set.send(text);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -271,6 +440,9 @@ async fn network(
                 Some(_) => {}
                 None => return Ok(()),
             },
+            Some(text) = recv_clipboard(&mut clipboard) => {
+                send_ctrl(&net_tx, ctrl, &CtrlMsg::Clipboard { text }).await;
+            }
             _ = tick.tick() => {
                 ping_seq += 1;
                 ping_sent = Some((ping_seq, Instant::now()));
@@ -281,6 +453,24 @@ async fn network(
             }
         }
     }
+}
+
+async fn recv_clipboard(sync: &mut Option<crate::clipboard::ClipboardSync>) -> Option<String> {
+    match sync {
+        Some(s) => s.changed.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// winit names keys after the W3C UI Events `code` values, except that it
+/// calls the OS key "Super" where W3C says "Meta".
+fn w3c_code(code: KeyCode) -> Option<String> {
+    let name = match code {
+        KeyCode::SuperLeft | KeyCode::Meta => "MetaLeft".to_owned(),
+        KeyCode::SuperRight => "MetaRight".to_owned(),
+        other => format!("{other:?}"),
+    };
+    Some(name)
 }
 
 async fn send_ctrl(tx: &mpsc::Sender<NetCmd>, id: ChannelId, msg: &CtrlMsg) {

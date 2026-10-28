@@ -1,8 +1,10 @@
 mod check;
 mod client;
+mod clipboard;
 mod config;
 mod host;
 mod monitor;
+mod remote;
 mod render;
 mod signal_client;
 mod stream;
@@ -37,7 +39,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Make this PC reachable: register its ID and accept password-authenticated connections.
-    Host,
+    Host {
+        /// Viewers can watch but not control the mouse and keyboard.
+        #[arg(long)]
+        view_only: bool,
+        /// Don't sync the clipboard with viewers.
+        #[arg(long)]
+        no_clipboard: bool,
+    },
     /// Set or change this host's password (or set REEMOTH_PASSWORD).
     SetPassword,
     /// Connect to a host and test the peer-to-peer link.
@@ -70,6 +79,9 @@ enum Command {
         /// Offer only the TURN relay candidate, to test the relay path.
         #[arg(long)]
         relay_only: bool,
+        /// Don't sync the clipboard with the host.
+        #[arg(long)]
+        no_clipboard: bool,
     },
     /// Test what this PC can do: screen capture, encoders, decoder, GPU, network.
     Check,
@@ -119,6 +131,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             id,
             password,
             relay_only,
+            no_clipboard,
         } => {
             let id = HostId::parse(&id).context("host ID must be nine digits")?;
             let target = client::Target {
@@ -127,7 +140,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 password: password_for(id, password)?,
                 relay_only,
             };
-            viewer::run(rt, target)
+            viewer::run(
+                rt,
+                target,
+                viewer::ViewOptions {
+                    clipboard: !no_clipboard,
+                },
+            )
         }
         command => rt.block_on(run_async(&mut cfg, signal_url, command)),
     }
@@ -150,13 +169,34 @@ async fn run_async(
 ) -> anyhow::Result<()> {
     match command {
         Command::View { .. } => unreachable!("handled before the runtime starts"),
-        Command::Host => {
+        Command::Host {
+            view_only,
+            no_clipboard,
+        } => {
+            // Capture and input injection must agree on pixel coordinates.
+            reemoth_input::enable_dpi_awareness();
+            // Ctrl+C would otherwise exit with injected keys still held down.
+            tokio::spawn(async {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    reemoth_input::release_everything();
+                    std::process::exit(130);
+                }
+            });
             if cfg.host_password()?.is_none() {
                 println!("No password set yet. Clients will need it to connect.");
                 let pw = host::prompt_new_password()?;
                 cfg.set_host_password(&pw)?;
             }
-            host::run(cfg, host::HostOptions { signal_url }).await
+            host::run(
+                cfg,
+                host::HostOptions {
+                    signal_url,
+                    allow_input: !view_only,
+                    // A view-only viewer must not read or replace the clipboard.
+                    sync_clipboard: !no_clipboard && !view_only,
+                },
+            )
+            .await
         }
         Command::SetPassword => {
             let pw = host::prompt_new_password()?;

@@ -68,7 +68,8 @@ pub fn save_snapshot(tag: &str, width: u32, height: u32, i420: &[u8]) -> anyhow:
     Ok(path)
 }
 
-pub fn stats_line(host: Option<&Stats>, viewer: &CtrlMsg) -> String {
+/// `input`: (pointer moves, other input events) applied in the last second.
+pub fn stats_line(host: Option<&Stats>, input: (u32, u32), viewer: &CtrlMsg) -> String {
     let CtrlMsg::ViewerStats {
         fps,
         decoded,
@@ -102,8 +103,13 @@ pub fn stats_line(host: Option<&Stats>, viewer: &CtrlMsg) -> String {
         None => "host -".into(),
     };
     let rtt = rtt_ms.map_or("-".into(), |r| format!("{r}ms"));
+    let input_part = if input == (0, 0) {
+        String::new()
+    } else {
+        format!(" | input {}mv {}ev", input.0, input.1)
+    };
     format!(
-        "{host_part} | viewer {fps}fps (dec {decoded}) {:.1}Mb/s dec {decode_ms:.1}ms ready {ready_ms:.1}ms gaps {gaps} stall {max_stall_ms}ms kfreq {keyframe_requests} rtt {rtt}",
+        "{host_part}{input_part} | viewer {fps}fps (dec {decoded}) {:.1}Mb/s dec {decode_ms:.1}ms ready {ready_ms:.1}ms gaps {gaps} stall {max_stall_ms}ms kfreq {keyframe_requests} rtt {rtt}",
         f64::from(*kbps) / 1e3
     )
 }
@@ -137,7 +143,7 @@ mod tests {
             max_stall_ms: 40,
             rtt_ms: Some(17),
         };
-        let line = stats_line(None, &v);
+        let line = stats_line(None, (0, 0), &v);
         assert!(
             line.contains("viewer 59fps") && line.contains("rtt 17ms") && line.contains("gaps 1")
         );

@@ -16,6 +16,7 @@ reemoth-proto = { path = "crates/reemoth-proto" }
 reemoth-auth = { path = "crates/reemoth-auth" }
 reemoth-net = { path = "crates/reemoth-net" }
 reemoth-video = { path = "crates/reemoth-video" }
+reemoth-input = { path = "crates/reemoth-input" }
 anyhow = "1.0.104"
 base64 = "0.22"
 tracing = "0.1"

@@ -86,6 +86,39 @@ pub enum CtrlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rtt_ms: Option<u32>,
     },
+    /// Viewer → host: a mouse button. Carries the position so the click
+    /// lands where the viewer saw the pointer, even if the latest move
+    /// (sent on the unreliable `input` channel) was lost.
+    MouseButton {
+        x: f32,
+        y: f32,
+        button: MouseButton,
+        down: bool,
+    },
+    /// Viewer → host: scroll, in wheel units (120 = one notch).
+    Wheel {
+        dx: f32,
+        dy: f32,
+    },
+    /// Viewer → host: a physical key, as a W3C UI Events `code` ("KeyA",
+    /// "ShiftLeft", "ArrowUp"...), so layouts are the host's business.
+    Key {
+        code: String,
+        down: bool,
+    },
+    /// Viewer → host: release every key and button the viewer pressed
+    /// (the window lost focus).
+    ReleaseInput,
+    /// Host → viewer: the pointer shape to show (CSS cursor names:
+    /// "default", "text", "pointer", "wait", ...).
+    Cursor {
+        shape: String,
+        visible: bool,
+    },
+    /// Either way: clipboard text changed.
+    Clipboard {
+        text: String,
+    },
     /// Viewer → host: the next binary message is a downscaled I420 copy of
     /// the picture on screen.
     Snapshot {
@@ -93,6 +126,33 @@ pub enum CtrlMsg {
         height: u32,
     },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+/// Unreliable `input` channel: the pointer position, normalized to the
+/// picture (0..1 on both axes). Only the newest one matters.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PointerMove {
+    pub x: f32,
+    pub y: f32,
+    /// Increases per move; the host ignores moves older than the last one
+    /// (the channel is unordered).
+    #[serde(default)]
+    pub seq: u32,
+}
+
+/// Label of the unreliable pointer channel.
+pub const INPUT_CHANNEL: &str = "input";
+/// Clipboard text larger than this is not synced.
+pub const MAX_CLIPBOARD_BYTES: usize = 48 * 1024;
 
 impl CtrlMsg {
     pub fn encode(&self) -> String {

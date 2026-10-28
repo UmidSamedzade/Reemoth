@@ -233,6 +233,15 @@ impl Renderer {
         })
     }
 
+    /// Where the picture is drawn, in window pixels: (left, top, width, height).
+    pub fn picture_rect(&self) -> Option<(f64, f64, f64, f64)> {
+        let p = self.planes.as_ref()?;
+        let (cw, ch) = (f64::from(self.config.width), f64::from(self.config.height));
+        let (sx, sy) = fit(p.width, p.height, self.config.width, self.config.height);
+        let (w, h) = (f64::from(sx) * cw, f64::from(sy) * ch);
+        Some(((cw - w) / 2.0, (ch - h) / 2.0, w, h))
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;

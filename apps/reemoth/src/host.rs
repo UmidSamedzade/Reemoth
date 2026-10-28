@@ -8,12 +8,13 @@ use anyhow::{Context, bail};
 use reemoth_auth::{HostPake, Lockout, PasswordSecret, b64, unb64};
 use reemoth_net::gather::GatherOptions;
 use reemoth_net::{NetEvent, Prepared, gather};
-use reemoth_proto::peer::{CtrlMsg, PeerMsg};
+use reemoth_proto::peer::{CtrlMsg, INPUT_CHANNEL, PeerMsg};
 use reemoth_proto::signal::{ErrorCode, HostId, Role, SessionId, SignalMsg};
 use tokio::sync::mpsc;
 
 use crate::config::ConfigFile;
 use crate::monitor;
+use crate::remote::RemoteInput;
 use crate::signal_client::{SignalConn, SignalTx};
 use crate::stream::{self, StreamControl};
 
@@ -33,6 +34,9 @@ impl std::error::Error for IdTaken {}
 
 pub struct HostOptions {
     pub signal_url: String,
+    /// Let viewers control the mouse and keyboard.
+    pub allow_input: bool,
+    pub sync_clipboard: bool,
 }
 
 struct Shared {
@@ -47,6 +51,8 @@ struct Shared {
     /// The session currently streaming. Windows allows one capture of a
     /// display per process, so a new viewer takes it over.
     active_stream: Arc<Mutex<Option<Arc<StreamControl>>>>,
+    allow_input: bool,
+    sync_clipboard: bool,
 }
 
 pub async fn run(cfg: &mut ConfigFile, opts: HostOptions) -> anyhow::Result<()> {
@@ -66,6 +72,8 @@ pub async fn run(cfg: &mut ConfigFile, opts: HostOptions) -> anyhow::Result<()> 
             lockout: lockout.clone(),
             attempt: attempt.clone(),
             active_stream: active_stream.clone(),
+            allow_input: opts.allow_input,
+            sync_clipboard: opts.sync_clipboard,
         });
 
         match register(&opts.signal_url, id, &identity).await {
@@ -253,13 +261,41 @@ async fn run_peer(prepared: Prepared, tag: &str, shared: &Shared) -> anyhow::Res
     let mut last_host: Option<stream::Stats> = None;
     // Snapshot being received: (width, height, bytes so far).
     let mut pending_snapshot: Option<(u32, u32, Vec<u8>)> = None;
+    let mut input_ch = None;
+    let mut remote = RemoteInput::new(shared.allow_input);
+    let mut cursor = reemoth_input::CursorWatcher::new();
+    let mut cursor_tick = tokio::time::interval(Duration::from_millis(50));
+    // Started with the video, so link tests (`reemoth connect`) never see it.
+    let mut clipboard = None;
+    let mut last_input = (0, 0);
     let result = loop {
         let event = tokio::select! {
             ev = peer.recv() => match ev {
                 Some(ev) => ev,
                 None => break Ok(()),
             },
+            _ = cursor_tick.tick(), if streaming.is_some() => {
+                if let (Some((shape, visible)), Some(id)) = (cursor.poll(), ctrl) {
+                    let msg = CtrlMsg::Cursor { shape: shape.into(), visible };
+                    let _ = peer.send(id, false, msg.encode().into_bytes()).await;
+                }
+                continue;
+            }
+            Some(text) = recv_clipboard(&mut clipboard) => {
+                if let Some(id) = ctrl {
+                    let _ = peer.send(id, false, CtrlMsg::Clipboard { text }.encode().into_bytes()).await;
+                }
+                continue;
+            }
             _ = stats_tick.tick() => {
+                last_input = remote.take_counts();
+                remote.watchdog();
+                if streaming.as_ref().is_some_and(|(c, _)| c.is_stopped()) {
+                    // Another viewer took over the screen; this one must not
+                    // keep controlling it or reading the clipboard.
+                    remote.disable();
+                    break Err(anyhow::anyhow!("another viewer took over this screen"));
+                }
                 if let (Some((control, _)), Some(id)) = (&streaming, ctrl) {
                     let s = control.take_stats();
                     last_host = Some(s.clone());
@@ -278,6 +314,9 @@ async fn run_peer(prepared: Prepared, tag: &str, shared: &Shared) -> anyhow::Res
                 continue;
             }
         };
+        if matches!(event, NetEvent::Data { .. }) {
+            remote.heard_from_viewer();
+        }
         match event {
             NetEvent::VideoReady if streaming.is_none() => {
                 println!(
@@ -296,6 +335,11 @@ async fn run_peer(prepared: Prepared, tag: &str, shared: &Shared) -> anyhow::Res
                 }
                 let handle = stream::spawn(peer.sender(), control.clone());
                 streaming = Some((control, handle));
+                if shared.sync_clipboard && clipboard.is_none() {
+                    clipboard = crate::clipboard::spawn()
+                        .map_err(|e| eprintln!("[{tag}] clipboard sync off: {e:#}"))
+                        .ok();
+                }
             }
             NetEvent::KeyframeRequested => {
                 if let Some((control, _)) = &streaming {
@@ -312,6 +356,15 @@ async fn run_peer(prepared: Prepared, tag: &str, shared: &Shared) -> anyhow::Res
                 path.kind, path.local, path.remote
             ),
             NetEvent::ChannelOpen { id, label } if label == "ctrl" => ctrl = Some(id),
+            NetEvent::ChannelOpen { id, label } if label == INPUT_CHANNEL => {
+                input_ch = Some(id);
+                if shared.allow_input {
+                    println!("[{tag}] remote control enabled");
+                }
+            }
+            NetEvent::Data { id, data, .. } if Some(id) == input_ch => {
+                remote.pointer(streaming.as_ref().map(|(c, _)| c.as_ref()), &data);
+            }
             NetEvent::Data {
                 id,
                 binary: false,
@@ -320,7 +373,15 @@ async fn run_peer(prepared: Prepared, tag: &str, shared: &Shared) -> anyhow::Res
                 let Ok(msg) = CtrlMsg::decode(&String::from_utf8_lossy(&data)) else {
                     continue;
                 };
+                if remote.handle(streaming.as_ref().map(|(c, _)| c.as_ref()), &msg) {
+                    continue;
+                }
                 match msg {
+                    CtrlMsg::Clipboard { text } => {
+                        if let Some(c) = &clipboard {
+                            let _ = c.set.send(text);
+                        }
+                    }
                     CtrlMsg::Ping { seq } => {
                         peer.send(id, false, CtrlMsg::Pong { seq }.encode().into_bytes())
                             .await?;
@@ -341,7 +402,7 @@ async fn run_peer(prepared: Prepared, tag: &str, shared: &Shared) -> anyhow::Res
                         }
                         println!(
                             "[{tag}] {}",
-                            monitor::stats_line(last_host.as_ref(), &report)
+                            monitor::stats_line(last_host.as_ref(), last_input, &report)
                         );
                     }
                     CtrlMsg::Snapshot { width, height } => {
@@ -428,6 +489,13 @@ fn check_lockout(
         );
     }
     Ok(())
+}
+
+async fn recv_clipboard(sync: &mut Option<crate::clipboard::ClipboardSync>) -> Option<String> {
+    match sync {
+        Some(s) => s.changed.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Short session label for logs.

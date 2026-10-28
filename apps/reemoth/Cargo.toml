@@ -12,7 +12,9 @@ reemoth-proto.workspace = true
 reemoth-auth.workspace = true
 reemoth-net.workspace = true
 reemoth-video.workspace = true
+reemoth-input.workspace = true
 anyhow.workspace = true
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 clap.workspace = true
 directories = "6"
 futures-util.workspace = true
@@ -30,6 +32,9 @@ yuv = "0.8.19"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wgpu = "25"
 winit = "0.30"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_DataExchange"] }
 
 [lints]
 workspace = true

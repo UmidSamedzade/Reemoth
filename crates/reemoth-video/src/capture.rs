@@ -111,6 +111,14 @@ impl DesktopCapture {
         (self.width, self.height)
     }
 
+    /// Where this display sits on the desktop: (left, top, width, height)
+    /// in physical pixels, the coordinate space input injection uses.
+    pub fn desktop_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        let desc = unsafe { self.output.GetDesc() }.ok()?;
+        let r = desc.DesktopCoordinates;
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
+
     /// Waits up to `timeout` for the screen to change.
     pub fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<CaptureResult<'_>> {
         self.unmap();

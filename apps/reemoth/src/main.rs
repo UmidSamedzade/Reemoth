@@ -1,3 +1,4 @@
+mod check;
 mod client;
 mod config;
 mod host;
@@ -70,6 +71,8 @@ enum Command {
         #[arg(long)]
         relay_only: bool,
     },
+    /// Test what this PC can do: screen capture, encoders, decoder, GPU, network.
+    Check,
     /// Show this PC's host ID and settings.
     Info,
     /// Round-trip pings to the signaling server.
@@ -204,6 +207,7 @@ async fn run_async(
             Ok(())
         }
         Command::SignalPing { count } => signal_ping(&signal_url, count).await,
+        Command::Check => check::run(&signal_url).await,
     }
 }
 

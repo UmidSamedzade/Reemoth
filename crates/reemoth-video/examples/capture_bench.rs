@@ -1,4 +1,5 @@
-//! Times capture → BGRA-to-I420 → software H.264 on the primary display.
+//! Times capture → convert → encode on the primary display with the encoder
+//! the host would pick (pass `--software` to force openh264).
 //!
 //!   cargo run --release -p reemoth-video --example capture_bench
 
@@ -7,40 +8,36 @@ fn main() -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     use reemoth_video::capture::{CaptureResult, DesktopCapture};
-    use reemoth_video::{Encoder, EncoderSettings, I420Frame};
 
+    let software = std::env::args().any(|a| a == "--software");
     let mut cap = DesktopCapture::primary()?;
-    println!("display {}x{}", cap.size().0, cap.size().1);
-    let mut enc = Encoder::new(EncoderSettings {
-        bitrate_bps: 15_000_000,
-        ..Default::default()
-    })?;
-    let mut frame = I420Frame::new(2, 2);
-    let (mut conv, mut encode, mut bytes, mut frames) =
-        (Duration::ZERO, Duration::ZERO, 0usize, 0u32);
+    let (w, h) = cap.size();
+    println!("display {w}x{h}");
+    let (mut enc, reports) = reemoth_video::open_best(w, h, 60, 15_000_000, !software)?;
+    for r in reports {
+        println!("  tested {}: {:?} {:?}", r.name, r.encode_ms, r.error);
+    }
+    println!("encoder: {}", enc.name());
+    let (mut total, mut bytes, mut frames, mut keyframes) = (Duration::ZERO, 0usize, 0u32, 0u32);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let CaptureResult::Frame(f) = cap.next_frame(Duration::from_millis(100))? else {
             continue;
         };
         let t = Instant::now();
-        frame.fill_from_bgra(f.bgra, f.width, f.height, f.stride)?;
-        conv += t.elapsed();
         if frames.is_multiple_of(60) {
             enc.force_keyframe();
         }
-        if let Some(e) = enc.encode(&frame)? {
-            encode += e.encode_time;
+        if let Some(e) = enc.encode_bgra(f.bgra, f.width, f.height, f.stride)? {
+            total += t.elapsed();
             bytes += e.data.len();
+            keyframes += u32::from(e.keyframe);
+            frames += 1;
         }
-        frames += 1;
     }
-    let n = frames.max(1);
     println!(
-        "{frames} frames in 5 s ({:.0} fps of screen changes): convert {:.2} ms, encode {:.2} ms per frame, {:.1} Mbit/s",
-        frames as f64 / 5.0,
-        conv.as_secs_f64() * 1e3 / n as f64,
-        encode.as_secs_f64() * 1e3 / n as f64,
+        "{frames} frames ({keyframes} keyframes) in 5 s: convert+encode {:.2} ms per frame, {:.1} Mbit/s",
+        total.as_secs_f64() * 1e3 / f64::from(frames.max(1)),
         bytes as f64 * 8.0 / 5.0 / 1e6
     );
     Ok(())

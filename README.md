@@ -2,7 +2,7 @@
 
 Low-latency peer-to-peer remote desktop for Windows and Linux. See [PLAN.md](PLAN.md) for the design and milestones.
 
-**Status: M1 (connectivity).** Two PCs on different networks find each other by host ID, authenticate with the host's password, and open a direct encrypted UDP link with no port forwarding. A TURN relay is used when a direct path is impossible. There is no screen sharing yet; `connect` measures latency and throughput over the link and opens a text chat to the host.
+**Status: M2 (screen streaming).** Two PCs on different networks find each other by host ID, authenticate with the host's password, and open a direct encrypted UDP link with no port forwarding (TURN relay when a direct path is impossible). A Windows host streams its screen as H.264 (hardware encoder when available: NVIDIA, AMD or Intel via Media Foundation; openh264 otherwise); `reemoth view` shows it on Windows or Linux. Mouse and keyboard control comes in M3.
 
 ## Layout
 
@@ -54,7 +54,15 @@ reemoth connect 123456789 --signal wss://reemoth-signaling.<you>.workers.dev
 
 It prints which path was used (`direct (local network)`, `direct (peer-to-peer over the internet)`, or `relayed`), the round-trip latency, and the throughput, then lets you type messages that appear on the host. Add `--relay-only` to force the TURN path, and `-v` for detailed logs.
 
-`reemoth info` shows the saved ID and settings.
+To watch the screen instead of running the link test:
+
+```bash
+reemoth view 123456789
+```
+
+While someone is viewing, the host prints both sides' numbers once a second (fps, encode/decode time, bitrate, losses, round trip) and saves a small snapshot of what the viewer shows every 15 s (path printed when streaming starts).
+
+`reemoth check` tests what a PC can do: screen capture, each video encoder (encoded and decoded for real), the decoder, the GPU the viewer would draw with, NAT type (whether direct P2P can work) and the signaling server. `reemoth info` shows the saved ID and settings.
 
 ## Develop
 

@@ -5,6 +5,7 @@
 //! over them on its own task and exposes data channels to the app.
 
 pub mod gather;
+pub mod nat;
 pub mod session;
 pub mod stun;
 pub mod turn;

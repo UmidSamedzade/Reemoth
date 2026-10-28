@@ -147,10 +147,24 @@ impl DesktopCapture {
             self.duplication.ReleaseFrame().context("ReleaseFrame")?;
         }
 
+        Ok(CaptureResult::Frame(self.map(&staging)?))
+    }
+
+    /// The most recent image again (e.g. to re-encode a keyframe while the
+    /// screen is still). `None` before the first frame.
+    pub fn last_frame(&mut self) -> anyhow::Result<Option<CapturedFrame<'_>>> {
+        self.unmap();
+        let Some(staging) = self.staging.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(self.map(&staging)?))
+    }
+
+    fn map(&mut self, staging: &ID3D11Texture2D) -> anyhow::Result<CapturedFrame<'_>> {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
             self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .context("mapping staging texture")?;
         }
         self.mapped = true;
@@ -159,12 +173,12 @@ impl DesktopCapture {
         // the next call (it takes `&mut self`, so the borrow ends first).
         let bgra =
             unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, stride * self.height) };
-        Ok(CaptureResult::Frame(CapturedFrame {
+        Ok(CapturedFrame {
             bgra,
             width: self.width,
             height: self.height,
             stride,
-        }))
+        })
     }
 
     fn staging_for(&mut self, source: &ID3D11Texture2D) -> anyhow::Result<ID3D11Texture2D> {

@@ -8,8 +8,11 @@ use std::time::{Duration, Instant};
 use reemoth_net::NetCmd;
 use tokio::sync::mpsc;
 
-/// Frame rate cap, regardless of the display's refresh rate.
-pub const MAX_FPS: f64 = 60.0;
+/// Frame rate cap with a software encoder (it can't sustain more at 1080p).
+const SOFTWARE_FPS: u32 = 60;
+/// With a hardware encoder: frames are cheap, and a higher rate means the
+/// viewer's next refresh always shows a fresher picture, even on a 60 Hz panel.
+const HARDWARE_FPS: u32 = 120;
 /// Encoder target never leaves this range, whatever bandwidth estimation says.
 const MIN_BITRATE: u32 = 1_500_000;
 const MAX_BITRATE: u32 = 20_000_000;
@@ -85,33 +88,58 @@ pub fn spawn(tx: mpsc::Sender<NetCmd>, control: Arc<StreamControl>) -> std::thre
 #[cfg(windows)]
 mod platform {
     use super::*;
+    use reemoth_video::VideoEncoder;
     use reemoth_video::capture::{CaptureResult, DesktopCapture};
-    use reemoth_video::{Encoder, EncoderSettings, I420Frame};
+
+    const START_BITRATE: u32 = 8_000_000;
+
+    fn open_encoder(
+        width: usize,
+        height: usize,
+        control: &StreamControl,
+        allow_hw: bool,
+    ) -> anyhow::Result<(VideoEncoder, Duration)> {
+        let (encoder, reports) =
+            reemoth_video::open_best(width, height, HARDWARE_FPS, START_BITRATE, allow_hw)?;
+        for r in &reports {
+            match (&r.error, r.encode_ms) {
+                (None, Some(ms)) => println!("  encoder check: {} OK ({ms:.1} ms/frame)", r.name),
+                (Some(e), _) => println!("  encoder check: {} unusable: {e}", r.name),
+                _ => {}
+            }
+        }
+        let fps = if encoder.is_hardware() {
+            HARDWARE_FPS
+        } else {
+            SOFTWARE_FPS
+        };
+        println!("  encoding with {} at up to {fps} fps", encoder.name());
+        control.stats.lock().expect("stats lock").encoder = encoder.name();
+        Ok((encoder, Duration::from_secs_f64(1.0 / f64::from(fps))))
+    }
 
     pub fn run(tx: &mpsc::Sender<NetCmd>, control: &StreamControl) -> anyhow::Result<()> {
         let mut capture = DesktopCapture::primary()?;
-        let mut encoder = Encoder::new(EncoderSettings {
-            bitrate_bps: 8_000_000,
-            max_fps: MAX_FPS as f32,
-            threads: 4,
-        })?;
-        control.bitrate.store(encoder.bitrate(), Ordering::Relaxed);
-        {
-            let mut s = control.stats.lock().expect("stats lock");
-            s.encoder = "openh264 (software)".into();
-        }
-        let mut frame = I420Frame::new(2, 2);
+        let (w, h) = capture.size();
+        let mut allow_hw = std::env::var_os("REEMOTH_SOFTWARE_ENCODER").is_none();
+        let (first, mut interval) = open_encoder(w, h, control, allow_hw)?;
+        // `None` only while being replaced, so the old one (and its GPU
+        // session) is gone before the new one opens.
+        let mut encoder = Some(first);
+        let mut encoder_size = (w, h);
+        control.bitrate.store(START_BITRATE, Ordering::Relaxed);
         let mut have_frame = false;
         // The latest captured image has not been sent (the encoder skipped it).
         let mut unsent = false;
         let start = Instant::now();
-        let interval = Duration::from_secs_f64(1.0 / MAX_FPS);
         let mut next_due = Instant::now();
         // The viewer cannot decode anything before the first keyframe.
         control.keyframe.store(true, Ordering::Relaxed);
 
         while !control.stop.load(Ordering::Relaxed) {
-            // Pace to MAX_FPS: wait until the next slot, then take whatever is newest.
+            // Pace to the frame-rate cap. When the screen was still, a change is
+            // picked up as soon as it happens; only during continuous motion
+            // does a frame wait for its slot.
             let now = Instant::now();
             if next_due > now {
                 std::thread::sleep(next_due - now);
@@ -125,29 +153,58 @@ mod platform {
             } else {
                 Duration::from_millis(100)
             };
-            match capture.next_frame(timeout)? {
-                CaptureResult::Frame(f) => {
-                    frame.fill_from_bgra(f.bgra, f.width, f.height, f.stride)?;
-                    have_frame = true;
+            let changed = matches!(capture.next_frame(timeout)?, CaptureResult::Frame(_));
+            if !changed && !resend {
+                if wants_keyframe {
+                    control.keyframe.store(true, Ordering::Relaxed);
                 }
-                CaptureResult::Unchanged if resend => {}
-                CaptureResult::Unchanged => {
-                    if wants_keyframe {
-                        control.keyframe.store(true, Ordering::Relaxed);
-                    }
-                    continue;
-                }
+                continue;
             }
             // Timed from here so the wait for a screen change is not counted.
             let captured_at = Instant::now();
             next_due = captured_at + interval;
+            have_frame = true;
             unsent = true;
-
-            encoder.set_bitrate(control.bitrate.load(Ordering::Relaxed));
-            if wants_keyframe {
-                encoder.force_keyframe();
+            let Some(f) = capture.last_frame()? else {
+                // Capture was just reset (desktop switch); keep the request.
+                if wants_keyframe {
+                    control.keyframe.store(true, Ordering::Relaxed);
+                }
+                continue;
+            };
+            let (fw, fh) = (f.width, f.height);
+            if (fw, fh) != encoder_size {
+                // Resolution changed: a hardware encoder is fixed-size, so reopen.
+                drop(encoder.take());
+                let (e, i) = open_encoder(fw, fh, control, allow_hw)?;
+                (encoder, interval, encoder_size) = (Some(e), i, (fw, fh));
+                control.keyframe.store(true, Ordering::Relaxed);
+                continue;
             }
-            let Some(encoded) = encoder.encode(&frame)? else {
+
+            let enc = encoder
+                .as_mut()
+                .expect("encoder is only None while reopening");
+            enc.set_bitrate(control.bitrate.load(Ordering::Relaxed));
+            if wants_keyframe {
+                enc.force_keyframe();
+            }
+            let encoded = match enc.encode_bgra(f.bgra, f.width, f.height, f.stride) {
+                Ok(encoded) => encoded,
+                Err(e) if enc.is_hardware() => {
+                    // A GPU encoder failing mid-stream: carry on in software.
+                    eprintln!("hardware encoder failed ({e:#}); switching to software encoding");
+                    reemoth_video::forget_hardware_choice();
+                    allow_hw = false;
+                    drop(encoder.take());
+                    let (e, i) = open_encoder(fw, fh, control, allow_hw)?;
+                    (encoder, interval) = (Some(e), i);
+                    control.keyframe.store(true, Ordering::Relaxed);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let Some(encoded) = encoded else {
                 // Over budget: `unsent` stays set, so the next slot retries.
                 if wants_keyframe {
                     control.keyframe.store(true, Ordering::Relaxed);
@@ -156,11 +213,11 @@ mod platform {
             };
             {
                 let mut s = control.stats.lock().expect("stats lock");
-                s.width = frame.width as u32;
-                s.height = frame.height as u32;
+                s.width = (fw & !1) as u32;
+                s.height = (fh & !1) as u32;
                 s.frames += 1;
                 s.encode_time += captured_at.elapsed();
-                s.bitrate_bps = encoder.bitrate();
+                s.bitrate_bps = control.bitrate.load(Ordering::Relaxed);
                 s.bytes += encoded.data.len() as u64;
                 s.keyframes += u32::from(encoded.keyframe);
             }
